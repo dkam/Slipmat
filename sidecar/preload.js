@@ -340,6 +340,18 @@ const commands = {
       startTime: startTimeMs / 1000,
     })
   },
+  // Play a station rather than a song list.
+  //
+  // Feature-detected, never assumed (rule 2): `setQueue` takes a `station` key
+  // in the MusicKit builds we have seen, but its descriptor is exactly the part
+  // Apple changes without warning — and when it is wrong this must say so
+  // rather than start nothing. An id string and an object are both accepted by
+  // MusicKit's own `toMediaItem`, so the string is what we send.
+  async setStation({ id }) {
+    if (typeof id !== 'string' || !id) throw new Error('no station id')
+    if (typeof music.setQueue !== 'function') throw new Error('MusicKit has no setQueue')
+    await music.setQueue({ station: id, startPlaying: true })
+  },
   play: () => music.play(),
   pause: () => music.pause(),
   playPause: () => (music.isPlaying ? music.pause() : music.play()),

@@ -14,7 +14,7 @@ use slipmat_core::ipc::{
     self, CatalogFilter, Event, PageKind, Request, Stage, Transport, WriteAction,
 };
 use slipmat_core::music::client::Client;
-use slipmat_core::music::types::Artwork;
+use slipmat_core::music::types::{Artwork, Shelf, ShelfItem, Station};
 use slipmat_core::player::protocol::{Command, Event as PlayerEvent, PlaybackState};
 use slipmat_core::player::{Incoming, sidecar};
 use slipmat_core::queue::{Start, queue_from_ids, start_index, unresolvable_ids};
@@ -101,6 +101,17 @@ pub struct Daemon {
     /// The desktop's own volume for this application, or `None` where there is
     /// no audio server to talk to.
     pub mixer: Option<crate::mixer::Mixer>,
+    /// Whether any client has ever asked for Home in this run.
+    ///
+    /// **A gate, not a cache.** [`Event::Home`] is a variant older clients
+    /// cannot read, and a client too old to read an event treats it as a lost
+    /// daemon rather than ignoring it (`climat`'s `link.rs`). A client that old
+    /// also never sends [`Request::Home`], so publishing only after somebody
+    /// has asked is what makes adding Home safe for every client already
+    /// installed.
+    pub home_wanted: std::cell::Cell<bool>,
+    /// Whether a Home fetch is in flight, so a second client cannot stack one.
+    pub home_fetching: std::cell::Cell<bool>,
     /// Rung by [`Request::Quit`], and answered where SIGTERM is — so leaving on
     /// purpose and being stopped by a service manager take the same path.
     pub quitting: tokio::sync::Notify,
@@ -208,6 +219,8 @@ pub async fn run() -> Result<()> {
         wake: tokio::sync::Notify::new(),
         quitting: tokio::sync::Notify::new(),
         mixer: crate::mixer::Mixer::start(),
+        home_wanted: std::cell::Cell::new(false),
+        home_fetching: std::cell::Cell::new(false),
     });
 
     // After the `Rc` exists: MPRIS holds one so a button on a bar can reach the
@@ -691,6 +704,7 @@ fn clear_account_state(daemon: &Daemon) {
     daemon.after_apply.take();
     daemon.art_for.borrow_mut().take();
     slipmat_core::library_cache::clear();
+    slipmat_core::home_cache::clear();
     slipmat_core::session::clear();
 
     daemon.publish(Event::Stage(Stage::SignedOut));
@@ -823,6 +837,17 @@ fn answer(
             offset,
         } => {
             search(daemon, query, filter, offset);
+            None
+        }
+        Request::Home => {
+            // Recorded before the answer so a refresh that lands later knows
+            // somebody is still waiting for it.
+            daemon.home_wanted.set(true);
+            home(daemon);
+            None
+        }
+        Request::PlayStation { id } => {
+            play_station(daemon, id);
             None
         }
         Request::Open { kind, id } => {
@@ -1182,6 +1207,146 @@ fn songs(tracks: Vec<slipmat_core::music::types::Track>) -> Vec<Entry> {
     tracks.into_iter().map(Entry::Song).collect()
 }
 
+/// Answer Home, and refresh it only if Apple says it has changed.
+///
+/// Two halves, deliberately in this order: **what we have goes out first**, so
+/// a launch draws shelves instead of a spinner, and then the fetch decides
+/// whether it was worth making. That is the library cache's discipline applied
+/// to a feed whose invalidation clock Apple publishes.
+fn home(daemon: &Rc<Daemon>) {
+    let cached = slipmat_core::home_cache::load();
+    if !cached.is_empty() {
+        daemon.publish(Event::Home {
+            shelves: cached.shelves.clone(),
+        });
+        if !cached.stale(slipmat_core::home_cache::now()) {
+            tracing::debug!("home is fresh; Apple has not dated it as changed");
+            return;
+        }
+    }
+    if daemon.library_client().is_none() {
+        // Nothing to fetch with — signed out, or the sidecar is not up. **Still
+        // answer**, because a client that asked is waiting on an event, and a
+        // spinner nobody will ever clear is the silent failure rule 6 forbids.
+        // The stage page says why; this only stops the wait.
+        tracing::debug!("home not refreshed: no usable session yet");
+        if cached.is_empty() {
+            daemon.publish(Event::Home {
+                shelves: Vec::new(),
+            });
+        }
+        return;
+    }
+    refresh_home(daemon);
+}
+
+/// Ask Apple for the shelves and the stations, and publish them.
+fn refresh_home(daemon: &Rc<Daemon>) {
+    let Some(client) = daemon.library_client() else {
+        tracing::debug!("home not refreshed: no usable session yet");
+        return;
+    };
+    if daemon.home_fetching.replace(true) {
+        tracing::debug!("home already being fetched");
+        return;
+    }
+    let generation = daemon.authorization_generation.get();
+    let daemon = daemon.clone();
+    tokio::task::spawn_local(async move {
+        // Three requests that do not depend on each other, and the whole point
+        // is that Home is complete when it lands.
+        let (recommendations, personal, recent) = tokio::join!(
+            client.recommendations(),
+            client.personal_station(),
+            client.recent_stations(),
+        );
+        daemon.home_fetching.set(false);
+
+        // A different account signed in while this was in flight; its shelves
+        // are not ours to publish.
+        if daemon.authorization_generation.get() != generation {
+            tracing::debug!("dropping home fetched for another account");
+            return;
+        }
+
+        let mut shelves: Vec<Shelf> = Vec::new();
+        let mut stations: Vec<Station> = Vec::new();
+        let mut failed = false;
+        match personal {
+            Ok(Some(station)) => stations.push(station),
+            Ok(None) => tracing::info!("Apple has no personal station for this account"),
+            Err(err) => {
+                failed = true;
+                tracing::warn!(?err, "personal station failed");
+            }
+        }
+        match recent {
+            // The personal station is usually in here too, as whatever it was
+            // called when it was last played.
+            Ok(list) => stations.extend(list),
+            Err(err) => {
+                failed = true;
+                tracing::warn!(?err, "recent stations failed");
+            }
+        }
+        stations.dedup_by(|a, b| a.id == b.id);
+        if !stations.is_empty() {
+            shelves.push(Shelf {
+                title: "Stations".into(),
+                // No date: a station shelf changes when you listen, so it is
+                // always worth the two cheap requests next launch.
+                next_update: String::new(),
+                items: stations.into_iter().map(ShelfItem::Station).collect(),
+            });
+        }
+        match recommendations {
+            Ok(found) => shelves.extend(found),
+            Err(err) => {
+                failed = true;
+                tracing::warn!(?err, "recommendations failed");
+            }
+        }
+
+        // Nothing at all is a fact about the account, not a reason to blank a
+        // Home that is already drawn — but it must still be *said*, or the
+        // client keeps its spinner up for an answer that already arrived.
+        if shelves.is_empty() {
+            tracing::info!(failed, "Apple returned no home content");
+            if failed {
+                daemon.publish(Event::Error {
+                    detail: "Could not reach Apple Music for Home".into(),
+                });
+            } else {
+                daemon.publish(Event::Home { shelves });
+            }
+            return;
+        }
+        if !slipmat_core::home_cache::save(&shelves) {
+            tracing::warn!("could not cache home; publishing what we fetched");
+        }
+        if daemon.home_wanted.get() {
+            daemon.publish(Event::Home { shelves });
+        }
+    });
+}
+
+/// Start a station, and forget the session that cannot describe it.
+///
+/// **A station is not a queue that can be restored.** The items MusicKit
+/// generates are different next launch, so replaying them from `session.json`
+/// would be restoring a sequence that never existed. The mirror follows
+/// MusicKit's own events as always (rule 3).
+fn play_station(daemon: &Rc<Daemon>, id: String) {
+    tracing::info!(%id, "playing a station");
+    *daemon.last_queue.borrow_mut() = None;
+    *daemon.pending_start.borrow_mut() = None;
+    daemon.resume_at.set(None);
+    daemon.restore_start.set(None);
+    daemon.restart_at.borrow_mut().take();
+    slipmat_core::session::clear();
+    daemon.send(Command::SetStation { id });
+}
+
 /// Search the catalog and announce what came back.
 ///
 /// Spawned like `open_page`, and for the same reason: this is a network round
@@ -1535,6 +1700,8 @@ mod tests {
             wake: tokio::sync::Notify::new(),
             mixer: None,
             quitting: tokio::sync::Notify::new(),
+            home_wanted: std::cell::Cell::new(false),
+            home_fetching: std::cell::Cell::new(false),
         })
     }
 
@@ -1686,6 +1853,38 @@ mod tests {
 
         assert_eq!(persisted.get(), 0);
         assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_home_request_with_no_session_still_answers() {
+        // Signed out, there is nothing to fetch with — but a client that asked
+        // is waiting on an event, and silence leaves its spinner up for ever.
+        // Whatever the cache holds, the answer is a `Home` and not nothing.
+        let daemon = daemon();
+        let mut events = daemon.events.subscribe();
+        let mut feed = None;
+
+        let direct = answer(r#"{"req":"home"}"#, &daemon, &mut feed);
+
+        assert!(direct.is_none(), "Home is answered as an event");
+        assert!(daemon.home_wanted.get(), "asking is what allows publishing");
+        assert!(matches!(events.try_recv(), Ok(Event::Home { .. })));
+    }
+
+    #[test]
+    fn playing_a_station_forgets_the_session_it_cannot_describe() {
+        // A station's queue is generated by MusicKit, so replaying the saved
+        // one next launch would restore a sequence that never existed.
+        let daemon = daemon();
+        *daemon.last_queue.borrow_mut() = Some((vec!["1440857781".into()], None));
+        *daemon.pending_start.borrow_mut() = Some("1440857781".into());
+        daemon.resume_at.set(Some(42_000));
+
+        play_station(&daemon, "ra.1234".into());
+
+        assert!(daemon.last_queue.borrow().is_none());
+        assert!(daemon.pending_start.borrow().is_none());
+        assert_eq!(daemon.resume_at.get(), None);
     }
 
     #[test]

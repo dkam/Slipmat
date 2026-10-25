@@ -10,7 +10,7 @@
 
 use relm4::ComponentSender;
 
-use super::{AppModel, CommandMsg, Stage};
+use super::{AppModel, CommandMsg, Stage, View};
 use crate::daemon;
 use slipmat_core::ipc::{Event, Request, Stage as DaemonStage, Transport};
 
@@ -89,6 +89,12 @@ impl AppModel {
                 self.ask(Request::Stage);
                 self.ask(Request::Snapshot);
                 self.ask(Request::Queue);
+                // Home is not asked for on every connect — only when it is
+                // what the window is showing, so a client that lives in the
+                // library never costs Apple a recommendations call.
+                if self.view == View::Home && !self.tried_home {
+                    self.ask_home();
+                }
             }
             daemon::Incoming::Event(event) => self.on_event(*event, sender),
             daemon::Incoming::Unparsed(line) => {
@@ -169,6 +175,7 @@ impl AppModel {
                 // and does its own filtering, sorting and grids, which is
                 // presentation rather than something to ask across a socket.
             }
+            Event::Home { shelves } => self.fill_home(shelves, sender),
             Event::Error { detail } => self.toast(&detail),
         }
     }

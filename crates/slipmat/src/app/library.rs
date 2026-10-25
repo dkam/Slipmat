@@ -107,6 +107,9 @@ impl AppModel {
 
     fn rebuild_current_section(&mut self) {
         match self.view {
+            // Nothing to rebuild: the shelves are drawn by `home.rs`, which
+            // owns their box, and `seed_home` calls it when that is the view.
+            View::Home => {}
             View::Albums => self.rebuild_albums(),
             View::Artists => self.rebuild_artists(),
             View::Playlists => self.rebuild_playlists(),
@@ -508,6 +511,25 @@ impl AppModel {
         }
         for art in self.playlists.iter().filter_map(|p| p.artwork.as_ref()) {
             keys.insert(art.cache_key());
+        }
+        // Home's tiles are mostly the library's own albums and playlists, but
+        // not all of them: a recommendation is often something you do not own,
+        // and pruning its cover would blank the shelf until Apple answered.
+        for shelf in &self.home {
+            for item in &shelf.items {
+                let art = match item {
+                    slipmat_core::music::types::ShelfItem::Album(album) => album.artwork.as_ref(),
+                    slipmat_core::music::types::ShelfItem::Playlist(playlist) => {
+                        playlist.artwork.as_ref()
+                    }
+                    slipmat_core::music::types::ShelfItem::Station(station) => {
+                        station.artwork.as_ref()
+                    }
+                };
+                if let Some(art) = art {
+                    keys.insert(art.cache_key());
+                }
+            }
         }
         keys
     }

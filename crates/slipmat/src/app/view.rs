@@ -24,8 +24,14 @@ pub use slipmat_core::sort::SortBy;
 /// library list was on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum View {
-    Search,
+    /// The landing view: Apple's shelves, and the user's stations.
+    ///
+    /// First in the sidebar because it is where a music app starts, and the
+    /// default because a client that opens on a flat song list is making a
+    /// different claim about what it is for (#35).
     #[default]
+    Home,
+    Search,
     Songs,
     Albums,
     Artists,
@@ -87,6 +93,22 @@ pub(super) fn section_index(rows: &[SidebarRow], view: View) -> Option<i32> {
         .and_then(|i| i32::try_from(i).ok())
 }
 
+/// The sidebar's group headings: which row carries one, and what it says.
+///
+/// **Derived from the rows, never written as indices.** Home landed at the top
+/// of the sidebar (#35) and every hard-coded index below it was then a heading
+/// on the wrong row — quietly, since a heading on the wrong row still draws.
+pub(super) fn sidebar_headings(rows: &[SidebarRow]) -> Vec<(i32, &'static str)> {
+    [
+        (View::Search, "Apple Music"),
+        (View::Songs, "Library"),
+        (View::Playlists, "Playlists"),
+    ]
+    .into_iter()
+    .filter_map(|(view, title)| section_index(rows, view).map(|index| (index, title)))
+    .collect()
+}
+
 impl View {
     /// The sidebar, in order.
     ///
@@ -95,7 +117,12 @@ impl View {
     ///
     /// The label is not [`View::title`]: the row says "Search" under a heading
     /// that says "Apple Music", and the narrow header has no heading to lean on.
-    pub(super) const SIDEBAR: [Row; 5] = [
+    pub(super) const SIDEBAR: [Row; 6] = [
+        Row {
+            view: Self::Home,
+            icon: "go-home-symbolic",
+            label: "Home",
+        },
         Row {
             view: Self::Search,
             icon: "system-search-symbolic",
@@ -135,6 +162,9 @@ impl View {
     pub(super) fn scope(self) -> SearchScope {
         match self {
             Self::Search => SearchScope::Catalog,
+            // Home has no search of its own: Apple's shelves are Apple's order,
+            // and filtering them locally would be inventing a question nobody
+            // asked. The search entry is not shown there either.
             _ => SearchScope::Library,
         }
     }
@@ -146,6 +176,7 @@ impl View {
     /// the selected row that normally answers "where am I" is off screen.
     pub(super) fn title(self) -> &'static str {
         match self {
+            Self::Home => "Home",
             Self::Search => "Apple Music",
             Self::Songs => "Songs",
             Self::Albums => "Albums",
@@ -158,6 +189,7 @@ impl View {
 impl From<Section> for View {
     fn from(section: Section) -> Self {
         match section {
+            Section::Home => Self::Home,
             Section::Library => Self::Songs,
             Section::Albums => Self::Albums,
             Section::Artists => Self::Artists,
@@ -170,6 +202,7 @@ impl From<Section> for View {
 impl From<View> for Section {
     fn from(view: View) -> Self {
         match view {
+            View::Home => Self::Home,
             View::Songs => Self::Library,
             View::Albums => Self::Albums,
             View::Artists => Self::Artists,
@@ -274,7 +307,10 @@ impl View {
             Self::Albums => slipmat_core::ipc::View::Albums,
             Self::Artists => slipmat_core::ipc::View::Artists,
             Self::Playlists => slipmat_core::ipc::View::Playlists,
-            Self::Songs | Self::Search => slipmat_core::ipc::View::Songs,
+            // Home has no sort at all — Apple ordered its shelves and the sort
+            // control is not shown there. It borrows the songs list's so this
+            // stays total, and `Sorts` never reads it back.
+            Self::Songs | Self::Search | Self::Home => slipmat_core::ipc::View::Songs,
         }
     }
 }
@@ -321,6 +357,10 @@ impl AppModel {
                 self.built_rows = None;
                 self.rebuild_rows();
             }
+            // Unreachable: the sort control is not shown on Home, and Apple
+            // ordered its shelves. Listed rather than wildcarded so a new
+            // section has to say what sorting it means.
+            View::Home => {}
         }
     }
 }
@@ -362,7 +402,7 @@ impl Sorts {
             View::Albums => self.albums,
             View::Artists => self.artists,
             View::Playlists => self.playlists,
-            View::Songs | View::Search => self.songs,
+            View::Songs | View::Search | View::Home => self.songs,
         }
     }
 
@@ -371,7 +411,7 @@ impl Sorts {
             View::Albums => &mut self.albums,
             View::Artists => &mut self.artists,
             View::Playlists => &mut self.playlists,
-            View::Songs | View::Search => &mut self.songs,
+            View::Songs | View::Search | View::Home => &mut self.songs,
         };
         *slot = sort;
     }
@@ -519,6 +559,7 @@ mod tests {
     #[test]
     fn the_view_round_trips_through_the_persisted_section() {
         for view in [
+            View::Home,
             View::Search,
             View::Songs,
             View::Albums,
@@ -532,9 +573,24 @@ mod tests {
     #[test]
     fn only_search_looks_at_the_catalog() {
         assert_eq!(View::Search.scope(), SearchScope::Catalog);
-        for view in [View::Songs, View::Albums, View::Artists, View::Playlists] {
+        for view in [
+            View::Home,
+            View::Songs,
+            View::Albums,
+            View::Artists,
+            View::Playlists,
+        ] {
             assert_eq!(view.scope(), SearchScope::Library);
         }
+    }
+
+    #[test]
+    fn home_comes_first_and_the_sidebar_still_finds_every_section() {
+        // Home is the landing view, so it must be the top row — and
+        // `section_index` is what selects the persisted one at startup, so a
+        // section it cannot find opens the app on a section nobody chose.
+        assert_eq!(View::SIDEBAR[0].view, View::Home);
+        assert_eq!(View::default(), View::Home);
     }
 
     #[test]

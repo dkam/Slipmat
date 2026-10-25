@@ -19,8 +19,9 @@ use serde::Deserialize;
 
 use super::types::{
     Album, AlbumAttributes, AlbumResource, Artist, ArtistAttributes, ArtistResource,
-    LibraryArtistResource, Playlist, PlaylistAttributes, RelationshipData, Resource, Response,
-    SongAttributes, SongContainers, Track,
+    LibraryArtistResource, Playlist, PlaylistAttributes, RecommendationResource, RelationshipData,
+    Resource, Response, Shelf, ShelfItem, SongAttributes, SongContainers, Station,
+    StationAttributes, Track,
 };
 
 /// What a catalog search turned up. Apple returns each kind in its own array;
@@ -562,6 +563,105 @@ impl Client {
             .await
             .with_context(|| format!("decoding {kind}"))?;
         Ok(parsed.data.into_iter().map(T::from).collect())
+    }
+
+    /// Apple's Home feed: the titled shelves `/me/recommendations` returns.
+    ///
+    /// `include=contents` is not decoration — a recommendation is a shell, and
+    /// the albums and playlists are in that relationship.
+    pub async fn recommendations(&self) -> Result<Vec<Shelf>> {
+        let res = self
+            .get("/me/recommendations?include=contents")
+            .send()
+            .await
+            .map_err(Self::transport_error)
+            .context("requesting recommendations")?;
+
+        if !res.status().is_success() {
+            return Err(self.explain(res).await);
+        }
+
+        let parsed: Response<RecommendationResource> =
+            res.json().await.context("decoding recommendations")?;
+        let shelves: Vec<Shelf> = parsed
+            .data
+            .into_iter()
+            .filter_map(RecommendationResource::into_shelf)
+            .collect();
+        // Measured rather than assumed: Apple documents albums and playlists,
+        // and a shelf holding anything else is the fact to know before trusting
+        // that documentation again.
+        let summary: Vec<String> = shelves
+            .iter()
+            .map(|shelf| {
+                let count = |wanted: fn(&ShelfItem) -> bool| {
+                    shelf.items.iter().filter(|item| wanted(item)).count()
+                };
+                format!(
+                    "{} [{}a/{}p/{}s]",
+                    shelf.title,
+                    count(|i| matches!(i, ShelfItem::Album(_))),
+                    count(|i| matches!(i, ShelfItem::Playlist(_))),
+                    count(|i| matches!(i, ShelfItem::Station(_))),
+                )
+            })
+            .collect();
+        tracing::info!(shelves = shelves.len(), ?summary, "home recommendations");
+        Ok(shelves)
+    }
+
+    /// The user's own station — "<Name>'s Station", as Apple names it.
+    ///
+    /// **A catalog path, with a personal filter**: Apple documents this as
+    /// `/catalog/{storefront}/stations?filter[identity]=personal`. The answer is
+    /// still built for one account, which is why the daemon gates it on the
+    /// user token rather than on the developer one.
+    pub async fn personal_station(&self) -> Result<Option<Station>> {
+        let res = self
+            .get(&format!(
+                "/catalog/{}/stations?filter[identity]=personal",
+                self.storefront
+            ))
+            .send()
+            .await
+            .map_err(Self::transport_error)
+            .context("requesting the personal station")?;
+
+        if !res.status().is_success() {
+            return Err(self.explain(res).await);
+        }
+
+        let parsed: Response<Resource<StationAttributes>> =
+            res.json().await.context("decoding the personal station")?;
+        let station = parsed.data.into_iter().next().map(Station::from);
+        tracing::info!(
+            found = station.as_ref().map(|s| s.name.as_str()).unwrap_or("none"),
+            "personal station"
+        );
+        Ok(station)
+    }
+
+    /// Stations the user played recently, in the order Apple ranks them.
+    pub async fn recent_stations(&self) -> Result<Vec<Station>> {
+        let res = self
+            .get("/me/recent/radio-stations")
+            .send()
+            .await
+            .map_err(Self::transport_error)
+            .context("requesting recent stations")?;
+
+        if !res.status().is_success() {
+            return Err(self.explain(res).await);
+        }
+
+        let parsed: Response<Resource<StationAttributes>> =
+            res.json().await.context("decoding recent stations")?;
+        let stations: Vec<Station> = parsed.data.into_iter().map(Station::from).collect();
+        let names: Vec<&str> = stations.iter().map(|s| s.name.as_str()).collect();
+        // Named, like the playlist artwork census: a count cannot say whether
+        // the personal station is among them.
+        tracing::info!(?names, "recently played stations");
+        Ok(stations)
     }
 
     /// Catalog search. Needs only the developer token — no user token, no
