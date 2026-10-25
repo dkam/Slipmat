@@ -154,19 +154,27 @@ impl AppModel {
         for (tile, item_index) in shelf.items.iter().map(Tile::from).zip(0..) {
             let view = TileView::new("shelf-tile");
             view.bind(&tile, &self.home_art_widgets, &self.tile_art_request);
-            // A click on a shelf tile is a person, and the strip can be rebuilt
-            // under it — so the handler carries the shelf and the position, and
-            // the reducer resolves them against the shelves it holds *now*.
-            let click = gtk::GestureClick::new();
+            view.without_pin_menu();
+            // **A button, not a click gesture.** Home is what the app opens on,
+            // and a gesture on a plain box cannot be reached with the keyboard
+            // at all — no focus ring, no Enter. The button carries the tile as
+            // its child and is styled flat (`.tile-button`) so nothing about
+            // the tile's look changes.
+            let button = gtk::Button::new();
+            button.set_has_frame(false);
+            button.add_css_class("tile-button");
+            button.set_child(Some(&view.root));
+            // A click is a person, and the strip can be rebuilt under it — so
+            // the handler carries the shelf and the position, and the reducer
+            // resolves them against the shelves it holds *now*.
             let sender = sender.clone();
-            click.connect_released(move |_, _, _, _| {
+            button.connect_clicked(move |_| {
                 sender.input(AppMsg::HomeTile {
                     shelf: shelf_index,
                     item: item_index,
                 });
             });
-            view.root.add_controller(click);
-            strip.append(&view.root);
+            strip.append(&button);
         }
 
         let scroller = gtk::ScrolledWindow::builder()

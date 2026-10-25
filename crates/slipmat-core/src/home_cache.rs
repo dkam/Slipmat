@@ -3,17 +3,20 @@
 
 //! Home, kept between runs so the shelves are on screen before Apple answers.
 //!
-//! Recolvable by definition — Apple will send the same shelves again, and it
+//! Rederivable by definition — Apple will send the same shelves again, and it
 //! even says when it will change them (`nextUpdateDate`). So this is a **cache**
 //! beside `library.json`, and never `$XDG_STATE_HOME`: losing it costs one slow
 //! launch, and nobody chose its contents.
 //!
 //! **The date is the point.** Refetching Home on every launch ignores a hint
 //! Apple volunteers, and the shelves would be identical anyway. [`Home::stale`]
-//! is the whole decision: a shelf Apple has not yet dated, or has dated and the
-//! date has passed, is worth a refetch; the rest are not. Shelves built from
-//! stations never carry a date — they change when you listen — which is why a
-//! Home with stations in it refetches on every launch and one without does not.
+//! is the whole decision: a shelf Apple has dated and whose date has passed is
+//! worth a refetch, and the rest are not.
+//!
+//! **Only dated shelves count.** The stations shelf never carries one — it
+//! changes when you listen — and treating an undated shelf as stale made every
+//! launch refetch all three requests, since almost every account has a personal
+//! station. A cache with no dates at all is the one case that always refetches.
 //!
 //! Read tolerantly and written best-effort, like the library: an unreadable
 //! file is an empty Home, never an error.
@@ -267,8 +270,9 @@ mod tests {
         let home = Home {
             version: VERSION,
             shelves: vec![
-                shelf("Made For You", "2030-01-01T00:00:00Z"),
                 shelf("Stations", ""),
+                shelf("Made For You", "2030-01-01T00:00:00Z"),
+                shelf("Recently Played", "2020-01-01T00:00:00Z"),
             ],
         };
         assert!(home.stale(now()));

@@ -371,6 +371,17 @@ impl TileView {
         }
     }
 
+    /// Withhold the pin menu from this tile.
+    ///
+    /// **A pin is a library id, and Home's playlists are catalog ones.** A
+    /// recommendation is Apple's playlist object with a `p.…` id from the
+    /// catalog space, so pinning it would store an id the sidebar can never
+    /// name — the row appeared as "Unavailable". Nothing else on a tile is
+    /// source-dependent, which is why this is a flag and not a second widget.
+    pub fn without_pin_menu(&self) {
+        *self.showing.borrow_mut() = None;
+    }
+
     /// Stop claiming the artwork `tile` had.
     pub fn unbind(&self, tile: &Tile, registry: &ArtRegistry) {
         // Stop claiming a widget this tile no longer owns, or a late fetch

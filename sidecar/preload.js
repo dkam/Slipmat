@@ -16,6 +16,10 @@ const { createOccurrenceId, createQueueIdentityProbe } = require('./queue-identi
 
 const READY_TIMEOUT_MS = 60_000
 const READY_POLL_MS = 250
+// How long a station may take to produce its first items. It generates them as
+// it starts rather than being handed a list, so the queue is legitimately empty
+// the instant `setQueue` resolves.
+const STATION_START_MS = 2_000
 const QUEUE_IDENTITY_PROBE = process.env.SLIPMAT_QUEUE_IDENTITY_PROBE === '1'
 
 let music = null
@@ -344,13 +348,25 @@ const commands = {
   //
   // Feature-detected, never assumed (rule 2): `setQueue` takes a `station` key
   // in the MusicKit builds we have seen, but its descriptor is exactly the part
-  // Apple changes without warning — and when it is wrong this must say so
-  // rather than start nothing. An id string and an object are both accepted by
-  // MusicKit's own `toMediaItem`, so the string is what we send.
+  // Apple changes without warning. An id string and an object are both accepted
+  // by MusicKit's own `toMediaItem`, so the string is what we send.
+  //
+  // **And confirmed.** A build that ignores the key resolves `setQueue` having
+  // queued nothing, which would be a click that reports success and plays
+  // silence — the failure rule 4 forbids. A station generates its items as it
+  // starts, so this waits for the first of them rather than reading the queue
+  // once.
   async setStation({ id }) {
     if (typeof id !== 'string' || !id) throw new Error('no station id')
     if (typeof music.setQueue !== 'function') throw new Error('MusicKit has no setQueue')
     await music.setQueue({ station: id, startPlaying: true })
+    const deadline = Date.now() + STATION_START_MS
+    while (Date.now() < deadline) {
+      if (music.isPlaying) return
+      if ((music.queue?.items?.length ?? 0) > 0) return
+      await new Promise((resolve) => setTimeout(resolve, READY_POLL_MS))
+    }
+    throw new Error('MusicKit accepted the station but nothing started')
   },
   play: () => music.play(),
   pause: () => music.pause(),

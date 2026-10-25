@@ -590,12 +590,35 @@ pub(crate) struct RecommendationResource {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RecommendationAttributes {
-    #[serde(default)]
-    pub title: String,
+    /// **An object, not a string**, despite reading like one everywhere else:
+    /// `{"stringForDisplay": "Made For You"}`. Measured against a real account
+    /// — the first attempt typed it as a `String` and every Home fetch failed
+    /// to decode. Both shapes are accepted rather than assuming Apple keeps the
+    /// wrapper.
+    pub title: Option<RecommendationTitle>,
     /// Apple volunteers when it will change this shelf. The only reason Home
     /// can be a cache rather than a refetch on every launch.
     #[serde(default)]
     pub next_update_date: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RecommendationTitle {
+    Text(String),
+    Localized {
+        #[serde(default, rename = "stringForDisplay")]
+        string_for_display: String,
+    },
+}
+
+impl RecommendationTitle {
+    fn into_string(self) -> String {
+        match self {
+            Self::Text(text) => text,
+            Self::Localized { string_for_display } => string_for_display,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -689,6 +712,10 @@ impl RecommendationResource {
     /// something and then shows a blank row.
     pub fn into_shelf(self) -> Option<Shelf> {
         let attributes = self.attributes.unwrap_or_default();
+        let title = attributes
+            .title
+            .map(RecommendationTitle::into_string)
+            .unwrap_or_default();
         let items: Vec<ShelfItem> = self
             .relationships
             .and_then(|r| r.contents)
@@ -702,14 +729,14 @@ impl RecommendationResource {
             .unwrap_or_default();
         if items.is_empty() {
             tracing::debug!(
-                title = %attributes.title,
+                %title,
                 id = %self.id,
                 "skipping a Home shelf with nothing in it"
             );
             return None;
         }
         Some(Shelf {
-            title: attributes.title,
+            title,
             next_update: attributes.next_update_date,
             items,
         })

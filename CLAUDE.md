@@ -837,7 +837,18 @@ This is Redux with a compiler: actions in, one reducer, view derived from state.
   a horizontally scrolling strip of the same tiles the grids bind. A station
   tile **plays** rather than opening a page — its queue is MusicKit's to
   generate, which is why `Command::SetStation` exists and why a station never
-  reaches `session.json`.
+  reaches `session.json` (`save_session` asks the daemon's station marker; the
+  mirror would otherwise write MusicKit's generated items down as a queue).
+
+  **Measured 2026-10-25, because none of it could be read off the docs:**
+  `/me/recommendations` returned 18 shelves whose contents are albums,
+  playlists **and stations** (15 station tiles, the personal one among them),
+  and `attributes.title` is an **object** (`stringForDisplay`), not a string —
+  typed as a `String`, every fetch failed to decode. `nextUpdateDate` came back
+  within a minute of the request itself, so it expires almost at once and the
+  cache buys the instant draw rather than a saved round trip. The personal
+  station answers, and is usually already in Apple's feed, so the station
+  endpoints are a **fallback shelf** holding only what the feed left out.
 - Rows are `adw::ActionRow` with artwork as prefix; activating a row sends
   `PlayTrack` with the **whole containing list** as the queue and the row's index
   as `start` — never a single-track queue (rule 3).
