@@ -46,21 +46,24 @@ impl Home {
 
     /// Whether Apple should be asked again.
     ///
-    /// One stale shelf refetches all of them: they arrive together, in one
+    /// One expired shelf refetches all of them: they arrive together, in one
     /// request, and a half-refreshed Home is a screen with two vintages on it.
+    ///
+    /// **An undated shelf is not an expired one.** The fallback stations shelf
+    /// never carries a date, so counting it made the date meaningless — every
+    /// launch refetched all three requests. Undated shelves ride along with the
+    /// dated ones; a cache with no dates at all is the one case with nothing to
+    /// go on, and always refetches.
     pub fn stale(&self, now: u64) -> bool {
-        if self.shelves.is_empty() {
+        let mut dated = self
+            .shelves
+            .iter()
+            .filter_map(|shelf| epoch_seconds(&shelf.next_update))
+            .peekable();
+        if dated.peek().is_none() {
             return true;
         }
-        self.shelves
-            .iter()
-            .any(|shelf| match epoch_seconds(&shelf.next_update) {
-                Some(due) => due <= now,
-                // No date, or one we cannot read. Refetching is the safe answer:
-                // the alternative is showing last month's feed forever because a
-                // date parsed to nothing.
-                None => true,
-            })
+        dated.any(|due| due <= now)
     }
 }
 
@@ -242,8 +245,8 @@ mod tests {
     }
 
     #[test]
-    fn an_undated_shelf_is_always_worth_refetching() {
-        // Stations never carry a date and change whenever you listen.
+    fn a_cache_with_no_dates_at_all_is_worth_refetching() {
+        // A cache of nothing but undated shelves has nothing to go on.
         assert!(
             Home {
                 version: VERSION,
@@ -251,6 +254,21 @@ mod tests {
             }
             .stale(1_800_000_000)
         );
+    }
+
+    #[test]
+    fn an_undated_shelf_rides_along_with_a_fresh_dated_one() {
+        // The rule this pins: every account has a personal station, its shelf
+        // has no date, and counting that as stale refetched all three requests
+        // on every launch — which made `nextUpdateDate` decorative.
+        let home = Home {
+            version: VERSION,
+            shelves: vec![
+                shelf("Stations", ""),
+                shelf("Made For You", "2030-01-01T00:00:00Z"),
+            ],
+        };
+        assert!(!home.stale(now()));
     }
 
     #[test]

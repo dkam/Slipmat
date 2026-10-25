@@ -57,7 +57,13 @@ pub enum Command {
     /// MusicKit's, which is the same rule as everywhere else (rule 3): Rust
     /// asks, MusicKit decides, and `PlayerState` mirrors the answer.
     #[serde(rename = "setStation", rename_all = "camelCase")]
-    SetStation { id: String },
+    SetStation {
+        /// `ra.…`.
+        id: String,
+        /// False exactly when restoring: the station comes back loaded and
+        /// idle, so pressing Play continues it and nothing starts by itself.
+        start_playing: bool,
+    },
 
     #[serde(rename = "play")]
     Play,

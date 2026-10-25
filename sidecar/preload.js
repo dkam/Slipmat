@@ -18,8 +18,10 @@ const READY_TIMEOUT_MS = 60_000
 const READY_POLL_MS = 250
 // How long a station may take to produce its first items. It generates them as
 // it starts rather than being handed a list, so the queue is legitimately empty
-// the instant `setQueue` resolves.
-const STATION_START_MS = 2_000
+// the instant `setQueue` resolves. Generous on purpose: nothing is delayed by
+// waiting, and a station that really did fail should say so rather than
+// half-start while Rust reports that it did not.
+const STATION_START_MS = 10_000
 const QUEUE_IDENTITY_PROBE = process.env.SLIPMAT_QUEUE_IDENTITY_PROBE === '1'
 
 let music = null
@@ -356,17 +358,23 @@ const commands = {
   // silence — the failure rule 4 forbids. A station generates its items as it
   // starts, so this waits for the first of them rather than reading the queue
   // once.
-  async setStation({ id }) {
+  async setStation({ id, startPlaying = true }) {
     if (typeof id !== 'string' || !id) throw new Error('no station id')
     if (typeof music.setQueue !== 'function') throw new Error('MusicKit has no setQueue')
-    await music.setQueue({ station: id, startPlaying: true })
+    await music.setQueue({ station: id, startPlaying })
     const deadline = Date.now() + STATION_START_MS
     while (Date.now() < deadline) {
-      if (music.isPlaying) return
+      // Restoring wants the items, not playback: coming back paused is the
+      // point, so `isPlaying` proves nothing there.
       if ((music.queue?.items?.length ?? 0) > 0) return
+      if (startPlaying && music.isPlaying) return
       await new Promise((resolve) => setTimeout(resolve, READY_POLL_MS))
     }
-    throw new Error('MusicKit accepted the station but nothing started')
+    throw new Error(
+      startPlaying
+        ? 'MusicKit accepted the station but nothing started'
+        : 'MusicKit accepted the station but queued nothing',
+    )
   },
   play: () => music.play(),
   pause: () => music.pause(),
