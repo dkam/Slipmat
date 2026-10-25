@@ -21,6 +21,7 @@
 //! | [`view`] | which section is showing, and the three encodings of that |
 //! | [`library`] | loading and filtering songs, albums, artists and search |
 //! | [`home`] | Apple's shelves, and the station tiles that play rather than open |
+//! | [`tiles`] | fetching tile covers: a ceiling on how many at once, and a retry |
 //! | [`queue`] | turning a click into a `setQueue`, and healing a rejected one |
 //! | [`pages`] | the album / artist navigation stack |
 //! | [`playback`] | pushing mirrored state to the bar, MPRIS, notifications |
@@ -80,6 +81,7 @@ mod queue;
 mod row_menu;
 mod status;
 mod supervise;
+mod tiles;
 mod view;
 mod wiring;
 mod writes;
@@ -101,6 +103,20 @@ const SEARCH_DEBOUNCE_MS: u64 = 350;
 /// Tile covers are fetched at twice their drawn size, so they stay sharp on a
 /// HiDPI screen without paying for the 512px the Now Playing bar needs.
 const TILE_ART: u32 = 320;
+
+/// How many tile covers may be in flight at once.
+///
+/// **A ceiling, not a tuning knob.** A vertical grid materialises ~40 tiles and
+/// a Home shelf builds every one of its own at once, so a cold Home asked
+/// Apple's image host for nearly two hundred covers in one burst — and 25 came
+/// back `Connection reset by peer`. A Home tile never rebinds, so one failed
+/// fetch was a permanent placeholder: the personal station had no cover while
+/// its artwork URL answered 200 on its own. Four at a time fills a screen
+/// quickly and looks nothing like a flood.
+const TILE_ART_PARALLEL: usize = 4;
+
+/// How many times a failed cover is worth asking for again.
+const TILE_ART_TRIES: u8 = 3;
 
 /// Stop paging here. Nobody scrolls 400 search results, and an unbounded list
 /// is an unbounded number of requests.
@@ -311,6 +327,12 @@ pub struct AppModel {
     /// Fetches already in flight, so a tile rebinding twice while scrolling
     /// does not queue the same download again.
     tile_art_pending: std::collections::HashSet<String>,
+    /// Covers waiting for a slot, and how many are being fetched now.
+    ///
+    /// The ceiling is what stops Home's ~180 first-time fetches arriving as a
+    /// burst; the queue is how a tile that lost its turn still gets painted.
+    tile_art_queue: std::collections::VecDeque<(String, Artwork, u8)>,
+    tile_art_in_flight: usize,
     /// Handed to every tile: "fetch this cover." An `Rc<dyn Fn>` rather than a
     /// sender because `bind` runs deep inside GTK's factory and has no access
     /// to the component — this is the same shape as the detail pages' click
@@ -649,6 +671,10 @@ pub enum CommandMsg {
     /// part and it has already happened, off the GTK thread (#27).
     TileArt {
         key: String,
+        /// Handed back so a failure can be retried: the result arrives in a
+        /// different message from the request, and only this knows the URL.
+        art: Artwork,
+        attempt: u8,
         path: Option<PathBuf>,
         cover: Option<artwork::Decoded>,
     },
@@ -1482,6 +1508,8 @@ impl Component for AppModel {
             artist_art_widgets: art_registry(),
             playlist_art_widgets: art_registry(),
             tile_art_pending: std::collections::HashSet::new(),
+            tile_art_queue: std::collections::VecDeque::new(),
+            tile_art_in_flight: 0,
             tile_art_request,
             catalog: Vec::new(),
             catalog_paged: 0,
@@ -1989,19 +2017,13 @@ impl AppModel {
             }
             AppMsg::HomeTile { shelf, item } => self.home_tile(shelf, item, &sender),
             AppMsg::NeedTileArt(key, art) => {
-                // Scrolling rebinds the same tile repeatedly; one request each.
-                if !self.tile_art_pending.insert(key.clone()) {
-                    return;
+                // Scrolling rebinds the same tile repeatedly, and the same
+                // cover sits on several shelves; one request each.
+                if self.tile_art_pending.insert(key.clone()) {
+                    self.tile_art_queue
+                        .push_back((key, art.clone(), TILE_ART_TRIES));
                 }
-                sender.oneshot_command(async move {
-                    // Fetch only if it is missing — `fetch` short-circuits on
-                    // the disk cache — but decode either way, off the GTK
-                    // thread. That is the whole point of #27: the tile is
-                    // handed pixels, not a filename. Either half failing is
-                    // cosmetic but never silent; `load_tile` says which.
-                    let (path, cover) = artwork::load_tile(art, TILE_ART, &key).await;
-                    CommandMsg::TileArt { key, path, cover }
-                });
+                self.pump_tile_art(&sender);
             }
             AppMsg::LoadMoreCatalog => {
                 // Guarded on all four conditions: only in catalog scope, only
@@ -2438,12 +2460,30 @@ impl AppModel {
                      (expected when not launched from its .desktop entry)"
                 ),
             },
-            CommandMsg::TileArt { key, path, cover } => {
-                self.tile_art_pending.remove(&key);
+            CommandMsg::TileArt {
+                key,
+                art,
+                attempt,
+                path,
+                cover,
+            } => {
+                self.tile_art_in_flight = self.tile_art_in_flight.saturating_sub(1);
                 let (Some(_path), Some(cover)) = (path, cover) else {
-                    // Cosmetic. The tile keeps its placeholder.
+                    // **Retried, because a Home tile never rebinds.** Apple's
+                    // image host resets a request when it has had enough of
+                    // them, and a tile that failed once used to keep its
+                    // placeholder until the section was rebuilt.
+                    if attempt > 1 {
+                        self.tile_art_queue
+                            .push_back((key, art, attempt.saturating_sub(1)));
+                    } else {
+                        self.tile_art_pending.remove(&key);
+                        tracing::warn!(%key, "no tile cover after retries; leaving the placeholder");
+                    }
+                    self.pump_tile_art(&sender);
                     return;
                 };
+                self.tile_art_pending.remove(&key);
 
                 // Paint **every** tile showing this artwork now. Recycling
                 // means they may not include the one that asked, and may be
@@ -2469,6 +2509,8 @@ impl AppModel {
                     }
                 }
                 tracing::trace!(%key, painted, "tile art delivered");
+                // One slot is free again; whatever is waiting takes it.
+                self.pump_tile_art(&sender);
             }
             CommandMsg::PageArtwork { page, path } => {
                 if let (Some(path), Some(target)) = (path, self.pages.iter().find(|p| p.id == page))
@@ -2592,6 +2634,8 @@ impl AppModel {
         self.focus_search = false;
         self.row_overrides.borrow_mut().clear();
         self.tile_art_pending.clear();
+        self.tile_art_queue.clear();
+        self.tile_art_in_flight = 0;
         self.page_for.clear();
 
         self.rebuild_rows();
