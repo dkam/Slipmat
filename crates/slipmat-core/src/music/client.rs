@@ -577,9 +577,30 @@ impl Client {
     ///
     /// `include=contents` is not decoration — a recommendation is a shell, and
     /// the albums and playlists are in that relationship.
+    ///
+    /// The web player's feed first, because only it carries Replay. Its host
+    /// is undocumented, so when it fails Home falls back to the documented
+    /// feed and loses that one shelf rather than its refresh.
     pub async fn recommendations(&self) -> Result<Vec<Shelf>> {
+        let mut feed = HomeFeed::WebPlayer;
+        loop {
+            match self.home_feed(feed).await {
+                Ok(shelves) => return Ok(shelves),
+                Err(err) => match feed.fallback() {
+                    Some(next) => {
+                        tracing::warn!(?err, ?feed, ?next, "home feed failed; falling back");
+                        feed = next;
+                    }
+                    None => return Err(err),
+                },
+            }
+        }
+    }
+
+    async fn home_feed(&self, feed: HomeFeed) -> Result<Vec<Shelf>> {
+        let (base, path) = feed.request(&local_utc_offset());
         let res = self
-            .get_from(WEB_API_BASE, &recommendations_path(&local_utc_offset()))
+            .get_from(base, &path)
             .send()
             .await
             .map_err(Self::transport_error)
@@ -614,7 +635,12 @@ impl Client {
                 )
             })
             .collect();
-        tracing::info!(shelves = shelves.len(), ?summary, "home recommendations");
+        tracing::info!(
+            ?feed,
+            shelves = shelves.len(),
+            ?summary,
+            "home recommendations"
+        );
         Ok(shelves)
     }
 
@@ -1038,14 +1064,38 @@ struct SearchWire {
     playlists: Option<Response<Resource<PlaylistAttributes>>>,
 }
 
-/// Home as `music.apple.com` asks for it. Without `name=listen-now` Apple
-/// sends a shorter feed with no Replay; with it, `platform` and `timezone`
-/// become required.
-fn recommendations_path(offset: &str) -> String {
-    format!(
-        "/me/recommendations?name=listen-now&platform=web&timezone={}&include=contents",
-        urlencode(offset)
-    )
+/// Which of Apple's two Home feeds to ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeFeed {
+    /// The one `music.apple.com` shows, Replay included, on its own host.
+    WebPlayer,
+    /// The documented one: shorter, and no Replay.
+    Public,
+}
+
+impl HomeFeed {
+    /// The host and path. `offset` is `+11:00`; only the web player's feed
+    /// takes one, and it refuses to answer without it.
+    fn request(self, offset: &str) -> (&'static str, String) {
+        match self {
+            Self::WebPlayer => (
+                WEB_API_BASE,
+                format!(
+                    "/me/recommendations?name=listen-now&platform=web&timezone={}&include=contents",
+                    urlencode(offset)
+                ),
+            ),
+            Self::Public => (API_BASE, "/me/recommendations?include=contents".into()),
+        }
+    }
+
+    /// What to ask for when this feed fails.
+    fn fallback(self) -> Option<HomeFeed> {
+        match self {
+            Self::WebPlayer => Some(Self::Public),
+            Self::Public => None,
+        }
+    }
 }
 
 /// `+11:00`, from seconds east of UTC.
@@ -1127,11 +1177,12 @@ mod tests {
     }
 
     #[test]
-    fn home_asks_for_the_listen_now_feed() {
+    fn home_asks_the_web_player_for_its_feed_first() {
         // The bare endpoint is a shorter feed: 17 shelves against 22, measured
         // 2026-10-26, and Replay is one of the five it leaves out. Apple
         // rejects `name` without both `platform` and `timezone`.
-        let path = recommendations_path("+11:00");
+        let (base, path) = HomeFeed::WebPlayer.request("+11:00");
+        assert_eq!(base, WEB_API_BASE);
         assert!(path.starts_with("/me/recommendations?"), "{path}");
         for part in [
             "name=listen-now",
@@ -1141,6 +1192,18 @@ mod tests {
         ] {
             assert!(path.contains(part), "{part} missing from {path}");
         }
+    }
+
+    #[test]
+    fn home_falls_back_to_the_documented_feed_and_no_further() {
+        // The web player's host is undocumented, so losing it must cost
+        // Replay alone, not every shelf's refresh.
+        assert_eq!(HomeFeed::WebPlayer.fallback(), Some(HomeFeed::Public));
+        assert_eq!(HomeFeed::Public.fallback(), None);
+        assert_eq!(
+            HomeFeed::Public.request("+11:00"),
+            (API_BASE, "/me/recommendations?include=contents".to_string())
+        );
     }
 
     #[test]
