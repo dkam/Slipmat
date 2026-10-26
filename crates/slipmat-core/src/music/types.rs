@@ -706,7 +706,7 @@ impl ContentResource {
 }
 
 impl RecommendationResource {
-    /// A shelf, or `None` for one with nothing drawable in it.
+    /// A shelf, or `None` for one with nothing drawable in it, or no title.
     ///
     /// An empty heading is worse than no heading: it claims Apple recommended
     /// something and then shows a blank row.
@@ -733,6 +733,10 @@ impl RecommendationResource {
                 id = %self.id,
                 "skipping a Home shelf with nothing in it"
             );
+            return None;
+        }
+        if title.is_empty() {
+            tracing::debug!(id = %self.id, "skipping a Home shelf with no title");
             return None;
         }
         Some(Shelf {
@@ -1150,5 +1154,42 @@ mod tests {
         assert_eq!(playlist.curator, "Apple Music");
         assert_eq!(playlist.description, "The songs everyone is playing.");
         assert!(playlist.artwork.is_some());
+    }
+
+    fn shelf(raw: &str) -> Option<Shelf> {
+        serde_json::from_str::<RecommendationResource>(raw)
+            .unwrap()
+            .into_shelf()
+    }
+
+    #[test]
+    fn replay_keeps_its_years_and_drops_the_editorial_card() {
+        // Apple's "Replay: Your Top Music" shelf leads with an editorial card
+        // Home has no tile for, then one playlist per year.
+        let replay = shelf(
+            r#"{"id":"23-x","attributes":{"title":{"stringForDisplay":"Replay: Your Top Music"}},
+              "relationships":{"contents":{"data":[
+                {"type":"editorial-items","id":"6444321639","attributes":{}},
+                {"type":"playlists","id":"pl.rp-pEEBClwO0E","attributes":{"name":"Replay 2015"}},
+                {"type":"playlists","id":"pl.rp-gQQ8HPgVyZ","attributes":{"name":"Replay 2022"}}]}}}"#,
+        )
+        .expect("the playlists make it a shelf");
+        assert_eq!(replay.title, "Replay: Your Top Music");
+        assert_eq!(replay.items.len(), 2);
+        assert!(matches!(&replay.items[0], ShelfItem::Playlist(p) if p.id == "pl.rp-pEEBClwO0E"));
+    }
+
+    #[test]
+    fn an_untitled_shelf_is_not_drawn() {
+        // The listen-now feed carries a one-tile banner with no title at all.
+        // Drawn, it is a strip under an empty heading.
+        assert!(
+            shelf(
+                r#"{"id":"15-x","attributes":{"nextUpdateDate":"2026-10-26T00:00:00Z"},
+                  "relationships":{"contents":{"data":[
+                    {"type":"playlists","id":"pl.1","attributes":{"name":"Antidote"}}]}}}"#,
+            )
+            .is_none()
+        );
     }
 }

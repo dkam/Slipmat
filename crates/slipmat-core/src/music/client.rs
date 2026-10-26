@@ -36,6 +36,10 @@ pub struct SearchResults {
 }
 
 const API_BASE: &str = "https://api.music.apple.com/v1";
+/// The web player's own host. Undocumented, and used for one request only:
+/// the public host refuses `platform=web` and every other platform it accepts
+/// needs permissions this token lacks, so Home's full feed is only here.
+const WEB_API_BASE: &str = "https://amp-api.music.apple.com/v1";
 /// The origin the harvested developer token is minted for — see `get()`.
 const WEB_ORIGIN: &str = "https://music.apple.com";
 const WEB_REFERER: &str = "https://music.apple.com/";
@@ -97,9 +101,13 @@ impl Client {
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        self.get_from(API_BASE, path)
+    }
+
+    fn get_from(&self, base: &str, path: &str) -> reqwest::RequestBuilder {
         let req = self
             .http
-            .get(format!("{API_BASE}{path}"))
+            .get(format!("{base}{path}"))
             .bearer_auth(&self.developer_token)
             // The harvested developer token is ORIGIN-LOCKED. Its JWT payload
             // carries `"root_https_origin": ["apple.com"]`, and the API
@@ -571,7 +579,7 @@ impl Client {
     /// the albums and playlists are in that relationship.
     pub async fn recommendations(&self) -> Result<Vec<Shelf>> {
         let res = self
-            .get("/me/recommendations?include=contents")
+            .get_from(WEB_API_BASE, &recommendations_path(&local_utc_offset()))
             .send()
             .await
             .map_err(Self::transport_error)
@@ -1030,6 +1038,38 @@ struct SearchWire {
     playlists: Option<Response<Resource<PlaylistAttributes>>>,
 }
 
+/// Home as `music.apple.com` asks for it. Without `name=listen-now` Apple
+/// sends a shorter feed with no Replay; with it, `platform` and `timezone`
+/// become required.
+fn recommendations_path(offset: &str) -> String {
+    format!(
+        "/me/recommendations?name=listen-now&platform=web&timezone={}&include=contents",
+        urlencode(offset)
+    )
+}
+
+/// `+11:00`, from seconds east of UTC.
+fn utc_offset(seconds: i64) -> String {
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let minutes = seconds.unsigned_abs() / 60;
+    format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// This machine's offset from UTC right now, so it follows daylight saving.
+fn local_utc_offset() -> String {
+    // SAFETY: `localtime_r` is the reentrant form and writes only into `tm`.
+    let seconds = unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            0
+        } else {
+            tm.tm_gmtoff
+        }
+    };
+    utc_offset(seconds)
+}
+
 /// Percent-encode a search term. The full `url` crate is a lot of dependency
 /// for one query parameter; this covers everything not unreserved per RFC 3986.
 fn urlencode(s: &str) -> String {
@@ -1084,6 +1124,31 @@ mod tests {
         // that as an error would make every no-results search look broken.
         let parsed: SearchResponse = serde_json::from_str(r#"{"results":{}}"#).unwrap();
         assert!(parsed.results.songs.is_none());
+    }
+
+    #[test]
+    fn home_asks_for_the_listen_now_feed() {
+        // The bare endpoint is a shorter feed: 17 shelves against 22, measured
+        // 2026-10-26, and Replay is one of the five it leaves out. Apple
+        // rejects `name` without both `platform` and `timezone`.
+        let path = recommendations_path("+11:00");
+        assert!(path.starts_with("/me/recommendations?"), "{path}");
+        for part in [
+            "name=listen-now",
+            "platform=web",
+            "timezone=%2B11%3A00",
+            "include=contents",
+        ] {
+            assert!(path.contains(part), "{part} missing from {path}");
+        }
+    }
+
+    #[test]
+    fn utc_offsets_are_written_the_way_apple_reads_them() {
+        assert_eq!(utc_offset(11 * 3600), "+11:00");
+        assert_eq!(utc_offset(0), "+00:00");
+        assert_eq!(utc_offset(-(4 * 3600 + 30 * 60)), "-04:30");
+        assert_eq!(utc_offset(5 * 3600 + 45 * 60), "+05:45");
     }
 
     #[test]
