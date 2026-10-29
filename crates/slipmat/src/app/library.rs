@@ -146,7 +146,9 @@ impl AppModel {
                 if sort.by.descends_by_default() != sort.reversed {
                     tracks.reverse();
                 }
-                tracks.into_iter().map(Entry::Song).collect()
+                let mut entries: Vec<Entry> = tracks.into_iter().map(Entry::Song).collect();
+                slipmat_core::sort::unplayable_last(&mut entries, &self.dead_rows.borrow());
+                entries
             }
             // Apple already ranked these; filtering them again locally would
             // only throw away results that matched for reasons we cannot see.

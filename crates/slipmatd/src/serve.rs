@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 
 use crate::bus;
 use crate::heal;
-use crate::library::Library;
+use crate::library::{Ask, Library};
 use crate::state::Model;
 use crate::watchdog;
 
@@ -800,9 +800,15 @@ fn answer(
             reverse,
         } => {
             let model = daemon.model.borrow();
-            let (entries, total) = model
-                .library
-                .browse(view, &query, offset, limit, sort, reverse);
+            let ask = Ask {
+                view,
+                query: &query,
+                offset,
+                limit,
+                sort,
+                reverse,
+            };
+            let (entries, total) = model.library.browse(&ask, &model.dead_ids);
             Some(Event::Rows {
                 view,
                 entries,
