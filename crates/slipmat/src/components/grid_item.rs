@@ -46,7 +46,7 @@ use relm4::typed_view::grid::RelmGridItem;
 use relm4::{gtk, view};
 
 use crate::components::cover::Cover;
-use slipmat_core::music::types::{Album, Artist, Artwork, Playlist};
+use slipmat_core::music::types::{Album, Artist, Artwork, Playlist, Station};
 
 /// Tile artwork, in logical pixels. Big enough to read, small enough that a
 /// library of a few hundred albums is a few hundred small JPEGs.
@@ -153,6 +153,10 @@ pub enum Tile {
     Album(Album),
     Artist(Artist),
     Playlist(Playlist),
+    /// A radio station. Home is the only place one appears, and clicking it
+    /// plays it rather than opening a page: a station has no track list until
+    /// MusicKit generates one.
+    Station(Station),
 }
 
 impl Tile {
@@ -161,6 +165,7 @@ impl Tile {
             Self::Album(a) => &a.name,
             Self::Artist(a) => &a.name,
             Self::Playlist(p) => &p.name,
+            Self::Station(s) => &s.name,
         }
     }
 
@@ -178,6 +183,10 @@ impl Tile {
             // single playlist grow to a dozen lines and shove the whole grid
             // out of shape. The page has room for the blurb; a tile does not.
             Self::Playlist(p) => p.curator.clone(),
+            // Not the description, for the same reason: a station's blurb is a
+            // sentence. "Station" says the one thing a tile cannot show — that
+            // clicking it starts something endless rather than opening a list.
+            Self::Station(_) => "Station".into(),
         }
     }
 
@@ -186,6 +195,7 @@ impl Tile {
             Self::Album(a) => a.artwork.as_ref(),
             Self::Artist(a) => a.artwork.as_ref(),
             Self::Playlist(p) => p.artwork.as_ref(),
+            Self::Station(s) => s.artwork.as_ref(),
         }
     }
 
@@ -196,6 +206,7 @@ impl Tile {
             Self::Album(_) => "media-optical-symbolic",
             Self::Artist(_) => "avatar-default-symbolic",
             Self::Playlist(_) => "view-list-symbolic",
+            Self::Station(_) => "media-playback-start-symbolic",
         }
     }
 
@@ -211,44 +222,35 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub struct GridItem {
-    pub tile: Tile,
-    registry: ArtRegistry,
-    request: ArtRequest,
-}
-
-impl GridItem {
-    pub fn new(tile: Tile, registry: ArtRegistry, request: ArtRequest) -> Self {
-        Self {
-            tile,
-            registry,
-            request,
-        }
-    }
-}
-
-pub struct GridItemWidgets {
-    cover: Cover,
-    title: gtk::Label,
-    subtitle: gtk::Label,
-    /// Which playlist this widget is currently showing, or `None` for an album,
-    /// an artist, or a tile between binds.
+/// The picture and two lines of caption — one tile's whole appearance.
+///
+/// **One owner of the drawing**, used twice: the grids recycle one of these per
+/// item through `RelmGridItem`, and Home builds one per tile and leaves it in a
+/// shelf. A second copy of this code is how a shelf tile and a grid tile come to
+/// look different, or how one of them keeps a stale cover.
+pub struct TileView {
+    pub root: gtk::Box,
+    pub cover: Cover,
+    pub title: gtk::Label,
+    pub subtitle: gtk::Label,
+    /// Which playlist this widget is currently showing, or `None` for anything
+    /// else.
     ///
-    /// The gesture is connected once in `setup` and lives as long as the widget,
-    /// which outlives every tile it displays — so it cannot capture one. A
-    /// right-click is a person, and a person is slow: the popover opens seconds
-    /// later, by which time the grid may have recycled this widget onto
-    /// something else. Reading the cell at click time is what keeps the menu
-    /// about the tile under the pointer.
+    /// The gesture is connected once when the widget is built and lives as long
+    /// as it does, which outlives every tile a recycled one displays — so it
+    /// cannot capture one. A right-click is a person, and a person is slow: the
+    /// popover opens seconds later, by which time the grid may have recycled
+    /// this widget onto something else. Reading the cell at click time is what
+    /// keeps the menu about the tile under the pointer.
     showing: Rc<RefCell<Option<String>>>,
 }
 
-impl RelmGridItem for GridItem {
-    type Root = gtk::Box;
-    type Widgets = GridItemWidgets;
-
-    fn setup(_item: &gtk::ListItem) -> (Self::Root, Self::Widgets) {
-        crate::components::count_widget("grid-tile");
+impl TileView {
+    /// `kind` is only for [`crate::components::count_widget`], so the
+    /// virtualisation measurement can tell a recycled grid tile from a shelf
+    /// tile that is never recycled and should not be counted as one.
+    pub fn new(kind: &'static str) -> Self {
+        crate::components::count_widget(kind);
 
         view! {
             root = gtk::Box {
@@ -300,7 +302,7 @@ impl RelmGridItem for GridItem {
         let over = root.clone();
         menu.connect_pressed(move |gesture, _, x, y| {
             let Some(playlist_id) = asked.borrow().clone() else {
-                return; // an album or an artist: nothing to pin
+                return; // an album, an artist, a station: nothing to pin
             };
             let Some(request) = TILE_MENU.with(|m| m.borrow().clone()) else {
                 return;
@@ -314,48 +316,47 @@ impl RelmGridItem for GridItem {
         });
         root.add_controller(menu);
 
-        (
+        Self {
             root,
-            GridItemWidgets {
-                cover,
-                title,
-                subtitle,
-                showing,
-            },
-        )
+            cover,
+            title,
+            subtitle,
+            showing,
+        }
     }
 
-    fn bind(&mut self, widgets: &mut Self::Widgets, _root: &mut Self::Root) {
-        // Set unconditionally, including back to `None`: this widget was showing
-        // something else a moment ago, and a recycled album that kept a
+    /// Show `tile` here, asking for its artwork.
+    pub fn bind(&self, tile: &Tile, registry: &ArtRegistry, request: &ArtRequest) {
+        // Set unconditionally, including back to `None`: a recycled widget was
+        // showing something else a moment ago, and a recycled album that kept a
         // playlist's id would offer to pin the wrong thing entirely.
-        *widgets.showing.borrow_mut() = match &self.tile {
+        *self.showing.borrow_mut() = match tile {
             Tile::Playlist(playlist) => Some(playlist.id.clone()),
-            Tile::Album(_) | Tile::Artist(_) => None,
+            Tile::Album(_) | Tile::Artist(_) | Tile::Station(_) => None,
         };
 
-        let title = one_line(self.tile.title());
-        widgets.title.set_label(&title);
+        let title = one_line(tile.title());
+        self.title.set_label(&title);
         // The full, untruncated name on hover — the tile always ellipsizes.
-        widgets.title.set_tooltip_text(Some(self.tile.title()));
+        self.title.set_tooltip_text(Some(tile.title()));
 
         // Collapsed to one line whatever it is. Ellipsizing caps a label's
         // *width*; an embedded newline still makes it two lines tall, and one
         // tall tile drags its whole row with it.
-        let subtitle = one_line(&self.tile.subtitle());
-        widgets.subtitle.set_visible(!subtitle.is_empty());
-        widgets.subtitle.set_label(&subtitle);
+        let subtitle = one_line(&tile.subtitle());
+        self.subtitle.set_visible(!subtitle.is_empty());
+        self.subtitle.set_label(&subtitle);
 
-        // Shape first, and unconditionally: this widget was showing a different
-        // tile a moment ago, and a recycled artist must not stay round when it
-        // comes back as an album.
-        if self.tile.round() {
-            widgets.cover.round(&title);
+        // Shape first, and unconditionally: a recycled widget was showing a
+        // different tile a moment ago, and a recycled artist must not stay round
+        // when it comes back as an album.
+        if tile.round() {
+            self.cover.round(&title);
         } else {
-            widgets.cover.square(self.tile.placeholder());
+            self.cover.square(tile.placeholder());
         }
 
-        if let Some(art) = self.tile.artwork() {
+        if let Some(art) = tile.artwork() {
             let key = art.cache_key();
             // **Always ask; never decode here.** A cover already on disk used
             // to be loaded inline, which is a 2.5ms JPEG decode on the GTK
@@ -365,19 +366,65 @@ impl RelmGridItem for GridItem {
             // The request answers off the thread either way: it fetches only
             // if the file is missing, and decodes in both cases. The tile keeps
             // its placeholder for a frame or two and then fills in.
-            (self.request)(key.clone(), art.clone());
-            register(&mut self.registry.borrow_mut(), key, &widgets.cover);
+            request(key.clone(), art.clone());
+            register(&mut registry.borrow_mut(), key, &self.cover);
         }
     }
 
-    fn unbind(&mut self, widgets: &mut Self::Widgets, _root: &mut Self::Root) {
-        // Stop claiming a widget this item no longer owns, or a late fetch
+    /// Withhold the pin menu from this tile.
+    ///
+    /// **A pin is a library id, and Home's playlists are catalog ones.** A
+    /// recommendation is Apple's playlist object with a `p.…` id from the
+    /// catalog space, so pinning it would store an id the sidebar can never
+    /// name — the row appeared as "Unavailable". Nothing else on a tile is
+    /// source-dependent, which is why this is a flag and not a second widget.
+    pub fn without_pin_menu(&self) {
+        *self.showing.borrow_mut() = None;
+    }
+
+    /// Stop claiming the artwork `tile` had.
+    pub fn unbind(&self, tile: &Tile, registry: &ArtRegistry) {
+        // Stop claiming a widget this tile no longer owns, or a late fetch
         // paints the wrong tile. Only *this* widget goes; other tiles showing
         // the same artwork are still live and still want it.
-        if let Some(art) = self.tile.artwork() {
+        if let Some(art) = tile.artwork() {
             let key = art.cache_key();
-            unregister(&mut self.registry.borrow_mut(), &key, &widgets.cover);
+            unregister(&mut registry.borrow_mut(), &key, &self.cover);
         }
+    }
+}
+
+pub struct GridItem {
+    pub tile: Tile,
+    registry: ArtRegistry,
+    request: ArtRequest,
+}
+
+impl GridItem {
+    pub fn new(tile: Tile, registry: ArtRegistry, request: ArtRequest) -> Self {
+        Self {
+            tile,
+            registry,
+            request,
+        }
+    }
+}
+
+impl RelmGridItem for GridItem {
+    type Root = gtk::Box;
+    type Widgets = TileView;
+
+    fn setup(_item: &gtk::ListItem) -> (Self::Root, Self::Widgets) {
+        let view = TileView::new("grid-tile");
+        (view.root.clone(), view)
+    }
+
+    fn bind(&mut self, widgets: &mut Self::Widgets, _root: &mut Self::Root) {
+        widgets.bind(&self.tile, &self.registry, &self.request);
+    }
+
+    fn unbind(&mut self, widgets: &mut Self::Widgets, _root: &mut Self::Root) {
+        widgets.unbind(&self.tile, &self.registry);
     }
 }
 

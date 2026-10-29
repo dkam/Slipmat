@@ -20,7 +20,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     /// Catalog ids, in the order they were sent to MusicKit.
+    #[serde(default)]
     pub songs: Vec<String>,
+    /// The **station** that was playing, if one was.
+    ///
+    /// A station's own id is the only part of it worth keeping: the tracks
+    /// MusicKit generated for it are different next time, so they are not
+    /// saved. Restoring this loads the station paused, and pressing Play
+    /// continues it — the same "do not start making noise" rule a queue
+    /// follows.
+    #[serde(default)]
+    pub station: Option<String>,
     /// Index into `songs` of the track that was current.
     #[serde(default)]
     pub start: usize,
@@ -52,8 +62,8 @@ pub fn load() -> Option<Session> {
 /// anybody's home directory.
 fn parse(raw: &str) -> Option<Session> {
     match serde_json::from_str::<Session>(raw) {
-        // An empty queue is nothing to restore, not an error.
-        Ok(session) if !session.songs.is_empty() => Some(session),
+        // Nothing to restore is not an error, whichever kind of nothing.
+        Ok(session) if !session.songs.is_empty() || session.station.is_some() => Some(session),
         Ok(_) => None,
         Err(err) => {
             // A file from a future version, or a truncated write. Say so once
@@ -92,6 +102,7 @@ mod tests {
     #[test]
     fn a_session_survives_the_round_trip() {
         let saved = Session {
+            station: None,
             songs: vec!["1440857781".into(), "1440857782".into()],
             start: 1,
             position_ms: 42_000,

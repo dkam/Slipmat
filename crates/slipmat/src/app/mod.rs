@@ -20,6 +20,8 @@
 //! | --- | --- |
 //! | [`view`] | which section is showing, and the three encodings of that |
 //! | [`library`] | loading and filtering songs, albums, artists and search |
+//! | [`home`] | Apple's shelves, and the station tiles that play rather than open |
+//! | [`tiles`] | fetching tile covers: a ceiling on how many at once, and a retry |
 //! | [`queue`] | turning a click into a `setQueue`, and healing a rejected one |
 //! | [`pages`] | the album / artist navigation stack |
 //! | [`playback`] | pushing mirrored state to the bar, MPRIS, notifications |
@@ -58,7 +60,7 @@ use crate::mirror::Mirror;
 use crate::notify;
 use crate::settings::{Section, Settings, Theme};
 use slipmat_core::ipc::{PlayMode, Request, Transport, WriteAction};
-use slipmat_core::music::types::{Album, Artist, Artwork, Playlist, Track};
+use slipmat_core::music::types::{Album, Artist, Artwork, Playlist, Shelf, Track};
 use slipmat_core::player::protocol::RepeatMode;
 
 /// How often the seek bar redraws while playing.
@@ -69,6 +71,7 @@ use slipmat_core::player::protocol::RepeatMode;
 /// should cost nothing (the same discipline as Pitwall's suspend-gated poll).
 mod background;
 mod chrome;
+mod home;
 mod library;
 mod osd;
 mod pages;
@@ -78,6 +81,7 @@ mod queue;
 mod row_menu;
 mod status;
 mod supervise;
+mod tiles;
 mod view;
 mod wiring;
 mod writes;
@@ -99,6 +103,20 @@ const SEARCH_DEBOUNCE_MS: u64 = 350;
 /// Tile covers are fetched at twice their drawn size, so they stay sharp on a
 /// HiDPI screen without paying for the 512px the Now Playing bar needs.
 const TILE_ART: u32 = 320;
+
+/// How many tile covers may be in flight at once.
+///
+/// **A ceiling, not a tuning knob.** A vertical grid materialises ~40 tiles and
+/// a Home shelf builds every one of its own at once, so a cold Home asked
+/// Apple's image host for nearly two hundred covers in one burst — and 25 came
+/// back `Connection reset by peer`. A Home tile never rebinds, so one failed
+/// fetch was a permanent placeholder: the personal station had no cover while
+/// its artwork URL answered 200 on its own. Four at a time fills a screen
+/// quickly and looks nothing like a flood.
+const TILE_ART_PARALLEL: usize = 4;
+
+/// How many times a failed cover is worth asking for again.
+const TILE_ART_TRIES: u8 = 3;
 
 /// Stop paging here. Nobody scrolls 400 search results, and an unbounded list
 /// is an unbounded number of requests.
@@ -262,6 +280,22 @@ pub struct AppModel {
     album_grid: TypedGridView<GridItem, gtk::NoSelection>,
     artist_grid: TypedGridView<GridItem, gtk::NoSelection>,
     playlist_grid: TypedGridView<GridItem, gtk::NoSelection>,
+    /// Apple's Home shelves, exactly as the daemon fetched them — empty until
+    /// the cache or the daemon has answered.
+    home: Vec<Shelf>,
+    /// The shelves are built into this box rather than declared in `view!`,
+    /// because there is one row per shelf and only Apple knows how many.
+    home_box: gtk::Box,
+    loading_home: bool,
+    /// Whether Home has ever been asked for, so switching back to it does not
+    /// ask again for an answer already held.
+    tried_home: bool,
+    /// The shelf headings and tile ids the widgets were built for — see
+    /// `rebuild_home`.
+    built_home: Option<String>,
+    /// One registry for Home, separate from the three grids: clearing it on a
+    /// rebuild must not unregister their live tiles.
+    home_art_widgets: ArtRegistry,
     loading_albums: bool,
     loading_artists: bool,
     loading_playlists: bool,
@@ -293,6 +327,12 @@ pub struct AppModel {
     /// Fetches already in flight, so a tile rebinding twice while scrolling
     /// does not queue the same download again.
     tile_art_pending: std::collections::HashSet<String>,
+    /// Covers waiting for a slot, and how many are being fetched now.
+    ///
+    /// The ceiling is what stops Home's ~180 first-time fetches arriving as a
+    /// burst; the queue is how a tile that lost its turn still gets painted.
+    tile_art_queue: std::collections::VecDeque<(String, Artwork, u8)>,
+    tile_art_in_flight: usize,
     /// Handed to every tile: "fetch this cover." An `Rc<dyn Fn>` rather than a
     /// sender because `bind` runs deep inside GTK's factory and has no access
     /// to the component — this is the same shape as the detail pages' click
@@ -487,6 +527,13 @@ pub enum AppMsg {
     AlbumActivated(u32),
     ArtistActivated(u32),
     PlaylistActivated(u32),
+    /// A tile on a Home shelf was clicked. Both positions are resolved against
+    /// the shelves held now, because a fetch can land between the click and
+    /// this message.
+    HomeTile {
+        shelf: usize,
+        item: usize,
+    },
     /// A tile is on screen and its cover is not on disk yet.
     NeedTileArt(String, Artwork),
     ToggleSidebar,
@@ -624,6 +671,10 @@ pub enum CommandMsg {
     /// part and it has already happened, off the GTK thread (#27).
     TileArt {
         key: String,
+        /// Handed back so a failure can be retried: the result arrives in a
+        /// different message from the request, and only this knows the URL.
+        art: Artwork,
+        attempt: u8,
         path: Option<PathBuf>,
         cover: Option<artwork::Decoded>,
     },
@@ -870,7 +921,8 @@ impl Component for AppModel {
                                             set_tooltip_text: Some("Search"),
                                             add_css_class: "flat",
                                             #[watch]
-                                            set_visible: model.narrow_header,
+                                            set_visible: model.narrow_header
+                                                && model.view != View::Home,
                                             #[watch]
                                             set_sensitive: model.controls_live(),
                                             // `set_active` plus a report back is
@@ -928,6 +980,9 @@ impl Component for AppModel {
                                                 set_sensitive: model.controls_live(),
                                                 #[watch]
                                                 set_placeholder_text: Some(match model.view {
+                                                    // Unreachable: the entry is
+                                                    // not shown on Home.
+                                                    View::Home => "Search",
                                                     View::Songs => "Search your library",
                                                     View::Albums => "Search albums",
                                                     View::Artists => "Search artists",
@@ -1016,7 +1071,8 @@ impl Component for AppModel {
                                             // re-ordering them locally would
                                             // throw away the ranking without
                                             // being able to reproduce it.
-                                            set_visible: model.view != View::Search,
+                                            set_visible: model.view != View::Search
+                                                && model.view != View::Home,
                                             // Visibility follows the section,
                                             // which says nothing about whether
                                             // there is a list to reorder yet.
@@ -1158,6 +1214,27 @@ impl Component for AppModel {
                                             },
                                         },
 
+                                        // Home: one scrolling page of shelves,
+                                        // each of which scrolls sideways. The
+                                        // rows are built in `app/home.rs`, not
+                                        // declared here, because only Apple
+                                        // knows how many shelves there are.
+                                        add_named[Some("home")] = &gtk::ScrolledWindow {
+                                            set_vexpand: true,
+                                            set_hscrollbar_policy: gtk::PolicyType::Never,
+                                            add_css_class: "plain-scroller",
+
+                                            #[local_ref]
+                                            home_box -> gtk::Box {
+                                                set_orientation: gtk::Orientation::Vertical,
+                                                set_spacing: 18,
+                                                set_margin_start: 12,
+                                                set_margin_end: 12,
+                                                set_margin_top: 12,
+                                                set_margin_bottom: 12,
+                                            },
+                                        },
+
                                         // An empty search box is not a failed
                                         // search. Telling someone that Apple
                                         // Music has nothing matching "" is
@@ -1175,6 +1252,19 @@ impl Component for AppModel {
                                             set_title: "Nothing here yet",
                                             set_description: Some(
                                                 "Slipmat refreshes your library after sign-in. Use Refresh to try again.",
+                                            ),
+                                        },
+
+                                        // Empty Home is not a failure: Apple's
+                                        // feed is built from what you listen to,
+                                        // so a new account has little to say.
+                                        // Saying that is better than a spinner
+                                        // that never stops.
+                                        add_named[Some("empty-home")] = &adw::StatusPage {
+                                            set_icon_name: Some("go-home-symbolic"),
+                                            set_title: "Nothing to recommend yet",
+                                            set_description: Some(
+                                                "Home is built from what you listen to. Use Refresh to ask Apple Music again.",
                                             ),
                                         },
 
@@ -1206,6 +1296,10 @@ impl Component for AppModel {
                                                     "Apple Music has nothing matching “{}”.",
                                                     model.query()
                                                 ),
+                                                // Home has no query, so it
+                                                // cannot reach this page; listed
+                                                // so a new section has to decide.
+                                                View::Home => String::new(),
                                             }),
                                         },
 
@@ -1391,6 +1485,14 @@ impl Component for AppModel {
             album_grid,
             artist_grid,
             playlist_grid,
+            home: Vec::new(),
+            // Declared in `view!`, so the field stays empty until
+            // `view_output!` hands it over below.
+            home_box: gtk::Box::new(gtk::Orientation::Vertical, 0),
+            loading_home: false,
+            tried_home: false,
+            built_home: None,
+            home_art_widgets: art_registry(),
             loading_albums: false,
             loading_artists: false,
             loading_playlists: false,
@@ -1406,6 +1508,8 @@ impl Component for AppModel {
             artist_art_widgets: art_registry(),
             playlist_art_widgets: art_registry(),
             tile_art_pending: std::collections::HashSet::new(),
+            tile_art_queue: std::collections::VecDeque::new(),
+            tile_art_in_flight: 0,
             tile_art_request,
             catalog: Vec::new(),
             catalog_paged: 0,
@@ -1483,6 +1587,7 @@ impl Component for AppModel {
         let toaster = &model.toaster;
         let now_playing_bar = model.now_playing.widget();
         let nav_view = &model.nav;
+        let home_box = &model.home_box;
         let album_grid = &model.album_grid.view;
         let artist_grid = &model.artist_grid.view;
         let playlist_grid = &model.playlist_grid.view;
@@ -1513,6 +1618,9 @@ impl Component for AppModel {
         // still runs the moment the sidecar is up; it lands quietly, or — far
         // more often — finds nothing changed and does not even rebuild.
         model.seed_from_cache();
+        // Home is the landing view, so its shelves are seeded the same way —
+        // from what Apple said last time, before the daemon has answered.
+        model.seed_home(&sender);
         // The rows exist by now but were drawn before the cache was read, so
         // every pin still says "Unavailable".
         model.refresh_pin_names();
@@ -1774,6 +1882,9 @@ impl AppModel {
                     View::Albums => self.rebuild_albums(),
                     View::Artists => self.rebuild_artists(),
                     View::Playlists => self.rebuild_playlists(),
+                    // Nowhere to put a query: Home has no search entry, so this
+                    // is unreachable rather than ignored.
+                    View::Home => {}
                     View::Search => {
                         self.search_gen = self.search_gen.wrapping_add(1);
                         let generation = self.search_gen;
@@ -1854,6 +1965,15 @@ impl AppModel {
                     View::Albums => self.rebuild_albums(),
                     View::Artists => self.rebuild_artists(),
                     View::Playlists => self.rebuild_playlists(),
+                    View::Home => {
+                        // Asked for the first time only: coming back to Home
+                        // shows the shelves already held, and pressing Reload
+                        // is how anyone asks Apple again.
+                        if !self.tried_home {
+                            self.ask_home();
+                        }
+                        self.rebuild_home(&sender);
+                    }
                     View::Search => {
                         self.search_gen = self.search_gen.wrapping_add(1);
                         let generation = self.search_gen;
@@ -1895,20 +2015,15 @@ impl AppModel {
                     sender.input(AppMsg::OpenPage(PageKind::playlist(playlist)));
                 }
             }
+            AppMsg::HomeTile { shelf, item } => self.home_tile(shelf, item, &sender),
             AppMsg::NeedTileArt(key, art) => {
-                // Scrolling rebinds the same tile repeatedly; one request each.
-                if !self.tile_art_pending.insert(key.clone()) {
-                    return;
+                // Scrolling rebinds the same tile repeatedly, and the same
+                // cover sits on several shelves; one request each.
+                if self.tile_art_pending.insert(key.clone()) {
+                    self.tile_art_queue
+                        .push_back((key, art.clone(), TILE_ART_TRIES));
                 }
-                sender.oneshot_command(async move {
-                    // Fetch only if it is missing — `fetch` short-circuits on
-                    // the disk cache — but decode either way, off the GTK
-                    // thread. That is the whole point of #27: the tile is
-                    // handed pixels, not a filename. Either half failing is
-                    // cosmetic but never silent; `load_tile` says which.
-                    let (path, cover) = artwork::load_tile(art, TILE_ART, &key).await;
-                    CommandMsg::TileArt { key, path, cover }
-                });
+                self.pump_tile_art(&sender);
             }
             AppMsg::LoadMoreCatalog => {
                 // Guarded on all four conditions: only in catalog scope, only
@@ -1930,6 +2045,12 @@ impl AppModel {
                 }
             }
             AppMsg::ReloadCurrentSection => {
+                if self.view == View::Home {
+                    // Home's own clock is Apple's `nextUpdateDate`; the daemon
+                    // decides whether asking is worth a round trip.
+                    self.ask_home();
+                    return;
+                }
                 self.reload(self.view, &sender);
                 self.set_library_refreshing(true);
                 self.ask(Request::Refresh);
@@ -2339,12 +2460,30 @@ impl AppModel {
                      (expected when not launched from its .desktop entry)"
                 ),
             },
-            CommandMsg::TileArt { key, path, cover } => {
-                self.tile_art_pending.remove(&key);
+            CommandMsg::TileArt {
+                key,
+                art,
+                attempt,
+                path,
+                cover,
+            } => {
+                self.tile_art_in_flight = self.tile_art_in_flight.saturating_sub(1);
                 let (Some(_path), Some(cover)) = (path, cover) else {
-                    // Cosmetic. The tile keeps its placeholder.
+                    // **Retried, because a Home tile never rebinds.** Apple's
+                    // image host resets a request when it has had enough of
+                    // them, and a tile that failed once used to keep its
+                    // placeholder until the section was rebuilt.
+                    if attempt > 1 {
+                        self.tile_art_queue
+                            .push_back((key, art, attempt.saturating_sub(1)));
+                    } else {
+                        self.tile_art_pending.remove(&key);
+                        tracing::warn!(%key, "no tile cover after retries; leaving the placeholder");
+                    }
+                    self.pump_tile_art(&sender);
                     return;
                 };
+                self.tile_art_pending.remove(&key);
 
                 // Paint **every** tile showing this artwork now. Recycling
                 // means they may not include the one that asked, and may be
@@ -2362,6 +2501,7 @@ impl AppModel {
                     &self.album_art_widgets,
                     &self.artist_art_widgets,
                     &self.playlist_art_widgets,
+                    &self.home_art_widgets,
                 ] {
                     for widget in registry.borrow().get(&key).into_iter().flatten() {
                         widget.set_texture(&texture);
@@ -2369,6 +2509,8 @@ impl AppModel {
                     }
                 }
                 tracing::trace!(%key, painted, "tile art delivered");
+                // One slot is free again; whatever is waiting takes it.
+                self.pump_tile_art(&sender);
             }
             CommandMsg::PageArtwork { page, path } => {
                 if let (Some(path), Some(target)) = (path, self.pages.iter().find(|p| p.id == page))
@@ -2444,6 +2586,9 @@ impl AppModel {
             View::Playlists => {
                 self.tried_playlists = false;
             }
+            View::Home => {
+                self.tried_home = false;
+            }
         }
     }
 
@@ -2468,6 +2613,10 @@ impl AppModel {
         self.tried_artists = false;
         self.tried_playlists = false;
         self.tried_library = false;
+        self.home.clear();
+        self.loading_home = false;
+        self.tried_home = false;
+        self.built_home = None;
         self.built_rows = None;
         self.built_albums = None;
         self.built_artists = None;
@@ -2485,12 +2634,15 @@ impl AppModel {
         self.focus_search = false;
         self.row_overrides.borrow_mut().clear();
         self.tile_art_pending.clear();
+        self.tile_art_queue.clear();
+        self.tile_art_in_flight = 0;
         self.page_for.clear();
 
         self.rebuild_rows();
         self.rebuild_albums();
         self.rebuild_artists();
         self.rebuild_playlists();
+        self.rebuild_home(sender);
 
         // Pages and the queue belonged to that session too.
         self.pop_to_results();

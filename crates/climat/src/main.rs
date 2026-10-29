@@ -824,6 +824,10 @@ impl App {
             Event::LibraryRefreshing { refreshing } => {
                 self.refreshing_library = refreshing;
             }
+            // Home is the GTK client's screen for now. The terminal knows the
+            // request exists — that is what keeps a new daemon from tearing
+            // this client's socket down — and draws nothing for it.
+            Event::Home { .. } => {}
             // The daemon refuses things — removing the track it is playing is
             // the one that will be hit most. Saying so is rule 4's job.
             Event::Error { detail } => self.message = Some(Notice::bad(detail)),

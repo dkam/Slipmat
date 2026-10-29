@@ -39,10 +39,7 @@ pub(super) fn connect(
 ) {
     sidebar_rows(model, widgets, sender);
     sidebar_selection(model, widgets, sender);
-    sidebar_headers(
-        widgets,
-        super::view::section_index(&model.sidebar_rows, View::Playlists).unwrap_or_default(),
-    );
+    sidebar_headers(widgets, super::view::sidebar_headings(&model.sidebar_rows));
     sort_menu(model, widgets, sender);
     catalog_filter_menu(model, widgets, sender);
     open_on_last_section(model, widgets);
@@ -56,7 +53,7 @@ pub(super) fn connect(
     model.volume_osd.sit_below_the_header(&widgets.content_bars);
 }
 
-/// Build the sidebar's five rows from [`View::SIDEBAR`].
+/// Build the sidebar's rows from [`View::SIDEBAR`].
 ///
 /// They were five near-identical `ListBoxRow`s in `view!` — 126 lines saying
 /// one thing five times, each carrying a comment repeating its own index.
@@ -226,21 +223,19 @@ fn section_row(view: View) -> &'static super::view::Row {
 /// The headings drawn above the row that starts each group.
 ///
 /// One `ListBox` with a header func, never one box per group — see the note in
-/// `view!` and 285b542. `playlists_row` is passed rather than hard-coded so the
-/// heading follows the row if the sections are ever reordered; everything below
-/// that row is a pin, which is why Playlists is the last group.
-fn sidebar_headers(widgets: &Widgets, playlists_row: i32) {
+/// `view!` and 285b542. The headings arrive as `(row, title)` pairs from
+/// `view::sidebar_headings`, computed from the rows themselves: a heading that
+/// names the section two rows below it draws perfectly and is still wrong.
+fn sidebar_headers(widgets: &Widgets, headings: Vec<(i32, &'static str)>) {
+    let first = headings.first().map(|(row, _)| *row);
     widgets.nav_list.set_header_func(move |row, _before| {
-        let title = match row.index() {
-            0 => "Apple Music",
-            1 => "Library",
-            index if index == playlists_row => "Playlists",
-            _ => return,
+        let Some((_, title)) = headings.iter().find(|(index, _)| *index == row.index()) else {
+            return;
         };
         let label = gtk::Label::new(Some(title));
         label.set_xalign(0.0);
         label.set_margin_start(16);
-        label.set_margin_top(if row.index() == 0 { 6 } else { 12 });
+        label.set_margin_top(if Some(row.index()) == first { 6 } else { 12 });
         label.set_margin_bottom(2);
         label.add_css_class("heading");
         label.add_css_class("dim-label");

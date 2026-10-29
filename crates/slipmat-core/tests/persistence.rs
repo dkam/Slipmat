@@ -25,6 +25,7 @@ fn persisted_snapshots_replace_the_destination() {
 
         slipmat_core::library_cache::save(&[], &[], &[], &[]);
         let saved = Session {
+            station: None,
             songs: vec!["1440857781".into()],
             start: 0,
             position_ms: 42_000,

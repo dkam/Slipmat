@@ -10,6 +10,7 @@
 pub mod artwork;
 pub mod catalog;
 pub mod entry;
+pub mod home_cache;
 pub mod ipc;
 pub mod library_cache;
 pub mod mpris;

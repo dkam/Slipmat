@@ -19,8 +19,9 @@ use serde::Deserialize;
 
 use super::types::{
     Album, AlbumAttributes, AlbumResource, Artist, ArtistAttributes, ArtistResource,
-    LibraryArtistResource, Playlist, PlaylistAttributes, RelationshipData, Resource, Response,
-    SongAttributes, SongContainers, Track,
+    LibraryArtistResource, Playlist, PlaylistAttributes, RecommendationResource, RelationshipData,
+    Resource, Response, Shelf, ShelfItem, SongAttributes, SongContainers, Station,
+    StationAttributes, Track,
 };
 
 /// What a catalog search turned up. Apple returns each kind in its own array;
@@ -35,6 +36,10 @@ pub struct SearchResults {
 }
 
 const API_BASE: &str = "https://api.music.apple.com/v1";
+/// The web player's own host. Undocumented, and used for one request only:
+/// the public host refuses `platform=web` and every other platform it accepts
+/// needs permissions this token lacks, so Home's full feed is only here.
+const WEB_API_BASE: &str = "https://amp-api.music.apple.com/v1";
 /// The origin the harvested developer token is minted for — see `get()`.
 const WEB_ORIGIN: &str = "https://music.apple.com";
 const WEB_REFERER: &str = "https://music.apple.com/";
@@ -96,9 +101,13 @@ impl Client {
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        self.get_from(API_BASE, path)
+    }
+
+    fn get_from(&self, base: &str, path: &str) -> reqwest::RequestBuilder {
         let req = self
             .http
-            .get(format!("{API_BASE}{path}"))
+            .get(format!("{base}{path}"))
             .bearer_auth(&self.developer_token)
             // The harvested developer token is ORIGIN-LOCKED. Its JWT payload
             // carries `"root_https_origin": ["apple.com"]`, and the API
@@ -564,6 +573,131 @@ impl Client {
         Ok(parsed.data.into_iter().map(T::from).collect())
     }
 
+    /// Apple's Home feed: the titled shelves `/me/recommendations` returns.
+    ///
+    /// `include=contents` is not decoration — a recommendation is a shell, and
+    /// the albums and playlists are in that relationship.
+    ///
+    /// The web player's feed first, because only it carries Replay. Its host
+    /// is undocumented, so when it fails Home falls back to the documented
+    /// feed and loses that one shelf rather than its refresh.
+    pub async fn recommendations(&self) -> Result<Vec<Shelf>> {
+        let mut feed = HomeFeed::WebPlayer;
+        loop {
+            match self.home_feed(feed).await {
+                Ok(shelves) => return Ok(shelves),
+                Err(err) => match feed.fallback() {
+                    Some(next) => {
+                        tracing::warn!(?err, ?feed, ?next, "home feed failed; falling back");
+                        feed = next;
+                    }
+                    None => return Err(err),
+                },
+            }
+        }
+    }
+
+    async fn home_feed(&self, feed: HomeFeed) -> Result<Vec<Shelf>> {
+        let (base, path) = feed.request(&local_utc_offset());
+        let res = self
+            .get_from(base, &path)
+            .send()
+            .await
+            .map_err(Self::transport_error)
+            .context("requesting recommendations")?;
+
+        if !res.status().is_success() {
+            return Err(self.explain(res).await);
+        }
+
+        let parsed: Response<RecommendationResource> =
+            res.json().await.context("decoding recommendations")?;
+        let shelves: Vec<Shelf> = parsed
+            .data
+            .into_iter()
+            .filter_map(RecommendationResource::into_shelf)
+            .collect();
+        // Measured rather than assumed: Apple documents albums and playlists,
+        // and a shelf holding anything else is the fact to know before trusting
+        // that documentation again.
+        let summary: Vec<String> = shelves
+            .iter()
+            .map(|shelf| {
+                let count = |wanted: fn(&ShelfItem) -> bool| {
+                    shelf.items.iter().filter(|item| wanted(item)).count()
+                };
+                format!(
+                    "{} [{}a/{}p/{}s]",
+                    shelf.title,
+                    count(|i| matches!(i, ShelfItem::Album(_))),
+                    count(|i| matches!(i, ShelfItem::Playlist(_))),
+                    count(|i| matches!(i, ShelfItem::Station(_))),
+                )
+            })
+            .collect();
+        tracing::info!(
+            ?feed,
+            shelves = shelves.len(),
+            ?summary,
+            "home recommendations"
+        );
+        Ok(shelves)
+    }
+
+    /// The user's own station — "<Name>'s Station", as Apple names it.
+    ///
+    /// **A catalog path, with a personal filter**: Apple documents this as
+    /// `/catalog/{storefront}/stations?filter[identity]=personal`. The answer is
+    /// still built for one account, which is why the daemon gates it on the
+    /// user token rather than on the developer one.
+    pub async fn personal_station(&self) -> Result<Option<Station>> {
+        let res = self
+            .get(&format!(
+                "/catalog/{}/stations?filter[identity]=personal",
+                self.storefront
+            ))
+            .send()
+            .await
+            .map_err(Self::transport_error)
+            .context("requesting the personal station")?;
+
+        if !res.status().is_success() {
+            return Err(self.explain(res).await);
+        }
+
+        let parsed: Response<Resource<StationAttributes>> =
+            res.json().await.context("decoding the personal station")?;
+        let station = parsed.data.into_iter().next().map(Station::from);
+        tracing::info!(
+            found = station.as_ref().map(|s| s.name.as_str()).unwrap_or("none"),
+            "personal station"
+        );
+        Ok(station)
+    }
+
+    /// Stations the user played recently, in the order Apple ranks them.
+    pub async fn recent_stations(&self) -> Result<Vec<Station>> {
+        let res = self
+            .get("/me/recent/radio-stations")
+            .send()
+            .await
+            .map_err(Self::transport_error)
+            .context("requesting recent stations")?;
+
+        if !res.status().is_success() {
+            return Err(self.explain(res).await);
+        }
+
+        let parsed: Response<Resource<StationAttributes>> =
+            res.json().await.context("decoding recent stations")?;
+        let stations: Vec<Station> = parsed.data.into_iter().map(Station::from).collect();
+        let names: Vec<&str> = stations.iter().map(|s| s.name.as_str()).collect();
+        // Named, like the playlist artwork census: a count cannot say whether
+        // the personal station is among them.
+        tracing::info!(?names, "recently played stations");
+        Ok(stations)
+    }
+
     /// Catalog search. Needs only the developer token — no user token, no
     /// subscription — which makes it the cheapest way to prove the harvested
     /// token actually works before any playback is involved.
@@ -930,6 +1064,62 @@ struct SearchWire {
     playlists: Option<Response<Resource<PlaylistAttributes>>>,
 }
 
+/// Which of Apple's two Home feeds to ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeFeed {
+    /// The one `music.apple.com` shows, Replay included, on its own host.
+    WebPlayer,
+    /// The documented one: shorter, and no Replay.
+    Public,
+}
+
+impl HomeFeed {
+    /// The host and path. `offset` is `+11:00`; only the web player's feed
+    /// takes one, and it refuses to answer without it.
+    fn request(self, offset: &str) -> (&'static str, String) {
+        match self {
+            Self::WebPlayer => (
+                WEB_API_BASE,
+                format!(
+                    "/me/recommendations?name=listen-now&platform=web&timezone={}&include=contents",
+                    urlencode(offset)
+                ),
+            ),
+            Self::Public => (API_BASE, "/me/recommendations?include=contents".into()),
+        }
+    }
+
+    /// What to ask for when this feed fails.
+    fn fallback(self) -> Option<HomeFeed> {
+        match self {
+            Self::WebPlayer => Some(Self::Public),
+            Self::Public => None,
+        }
+    }
+}
+
+/// `+11:00`, from seconds east of UTC.
+fn utc_offset(seconds: i64) -> String {
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let minutes = seconds.unsigned_abs() / 60;
+    format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// This machine's offset from UTC right now, so it follows daylight saving.
+fn local_utc_offset() -> String {
+    // SAFETY: `localtime_r` is the reentrant form and writes only into `tm`.
+    let seconds = unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            0
+        } else {
+            tm.tm_gmtoff
+        }
+    };
+    utc_offset(seconds)
+}
+
 /// Percent-encode a search term. The full `url` crate is a lot of dependency
 /// for one query parameter; this covers everything not unreserved per RFC 3986.
 fn urlencode(s: &str) -> String {
@@ -984,6 +1174,44 @@ mod tests {
         // that as an error would make every no-results search look broken.
         let parsed: SearchResponse = serde_json::from_str(r#"{"results":{}}"#).unwrap();
         assert!(parsed.results.songs.is_none());
+    }
+
+    #[test]
+    fn home_asks_the_web_player_for_its_feed_first() {
+        // The bare endpoint is a shorter feed: 17 shelves against 22, measured
+        // 2026-10-26, and Replay is one of the five it leaves out. Apple
+        // rejects `name` without both `platform` and `timezone`.
+        let (base, path) = HomeFeed::WebPlayer.request("+11:00");
+        assert_eq!(base, WEB_API_BASE);
+        assert!(path.starts_with("/me/recommendations?"), "{path}");
+        for part in [
+            "name=listen-now",
+            "platform=web",
+            "timezone=%2B11%3A00",
+            "include=contents",
+        ] {
+            assert!(path.contains(part), "{part} missing from {path}");
+        }
+    }
+
+    #[test]
+    fn home_falls_back_to_the_documented_feed_and_no_further() {
+        // The web player's host is undocumented, so losing it must cost
+        // Replay alone, not every shelf's refresh.
+        assert_eq!(HomeFeed::WebPlayer.fallback(), Some(HomeFeed::Public));
+        assert_eq!(HomeFeed::Public.fallback(), None);
+        assert_eq!(
+            HomeFeed::Public.request("+11:00"),
+            (API_BASE, "/me/recommendations?include=contents".to_string())
+        );
+    }
+
+    #[test]
+    fn utc_offsets_are_written_the_way_apple_reads_them() {
+        assert_eq!(utc_offset(11 * 3600), "+11:00");
+        assert_eq!(utc_offset(0), "+00:00");
+        assert_eq!(utc_offset(-(4 * 3600 + 30 * 60)), "-04:30");
+        assert_eq!(utc_offset(5 * 3600 + 45 * 60), "+05:45");
     }
 
     #[test]

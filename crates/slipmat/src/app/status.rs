@@ -55,6 +55,7 @@ impl AppModel {
         // stay insensitive until there is a session to ask, so the list can be
         // read and scrolled before anything can be fetched with no token.
         match self.view {
+            View::Home => !self.home.is_empty() || self.loading_home,
             View::Albums => !self.albums.is_empty() || self.loading_albums,
             View::Artists => !self.artists.is_empty() || self.loading_artists,
             View::Playlists => !self.playlists.is_empty() || self.loading_playlists,
@@ -67,6 +68,11 @@ impl AppModel {
     /// Wide, the entry *is* the title and there is nothing a button could
     /// reveal. Narrow, it takes the title's place only while asked for.
     pub(super) fn search_showing(&self) -> bool {
+        // Home has no query, so the entry would be a control that does
+        // nothing. The sidebar's Search row is where searching lives.
+        if self.view == View::Home {
+            return false;
+        }
         !self.narrow_header || self.searching
     }
 
@@ -84,6 +90,7 @@ impl AppModel {
     /// which is every one of them, from the sidebar's point of view.
     pub(super) fn loading_in(&self, view: View) -> bool {
         match view {
+            View::Home => self.loading_home,
             View::Albums => self.loading_albums,
             View::Artists => self.loading_artists,
             View::Playlists => self.loading_playlists,
@@ -119,6 +126,7 @@ impl AppModel {
             return self.headline();
         }
         match self.view {
+            View::Home => "Asking Apple Music what to recommend",
             View::Search => "Searching Apple Music",
             View::Albums => "Loading your albums",
             View::Artists => "Loading your artists",
@@ -158,6 +166,17 @@ impl AppModel {
         }
 
         match self.view {
+            View::Home => {
+                if !self.home.is_empty() {
+                    "home"
+                } else if self.loading_home {
+                    "loading"
+                } else {
+                    // Not a failure: Apple builds Home from what you listen
+                    // to, so a new account has little to say and no error.
+                    "empty-home"
+                }
+            }
             View::Songs => {
                 if self.loading_library && self.all_tracks.is_empty() {
                     "loading"

@@ -187,6 +187,44 @@ pub struct Artist {
     pub library: bool,
 }
 
+/// A radio station: the user's own personalised one, or one they played.
+///
+/// **Played by its own id, which is `ra.…`.** A station has no catalog twin, so
+/// there is no `catalog_id` here the way there is on a [`Track`], and
+/// [`crate::player::protocol::Command::SetStation`] exists because
+/// `SetQueue`'s song ids cannot name one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Station {
+    pub id: String,
+    pub name: String,
+    /// Apple's blurb, or empty. The personalised station carries none.
+    pub description: String,
+    pub artwork: Option<Artwork>,
+}
+
+/// One row of Home: a heading, and the tiles under it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Shelf {
+    pub title: String,
+    /// When Apple says the shelf changes, ISO 8601 UTC, or empty when it did
+    /// not say — which is every shelf built from stations. Read by
+    /// [`crate::home_cache`] to decide whether a refetch is worth making.
+    pub next_update: String,
+    pub items: Vec<ShelfItem>,
+}
+
+/// A tile Home can draw.
+///
+/// **Not the client's `Tile`**: this one crosses the wire and lives in the
+/// cache, so it carries the domain object rather than a display shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ShelfItem {
+    Album(Album),
+    Playlist(Playlist),
+    Station(Station),
+}
+
 // --- Apple's wire shapes. Private: they never escape this module. ------------
 
 #[derive(Debug, Clone, Deserialize)]
@@ -537,6 +575,218 @@ impl From<Resource<PlaylistAttributes>> for Playlist {
                 .map(|art| Artwork::new(art.url)),
             // Set by whichever client method fetched it, as for Album/Artist.
             library: false,
+        }
+    }
+}
+
+/// A `PersonalRecommendation`: a titled shelf whose contents are mixed.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RecommendationResource {
+    pub id: String,
+    pub attributes: Option<RecommendationAttributes>,
+    pub relationships: Option<RecommendationRelationships>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecommendationAttributes {
+    /// **An object, not a string**, despite reading like one everywhere else:
+    /// `{"stringForDisplay": "Made For You"}`. Measured against a real account
+    /// — the first attempt typed it as a `String` and every Home fetch failed
+    /// to decode. Both shapes are accepted rather than assuming Apple keeps the
+    /// wrapper.
+    pub title: Option<RecommendationTitle>,
+    /// Apple volunteers when it will change this shelf. The only reason Home
+    /// can be a cache rather than a refetch on every launch.
+    #[serde(default)]
+    pub next_update_date: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RecommendationTitle {
+    Text(String),
+    Localized {
+        #[serde(default, rename = "stringForDisplay")]
+        string_for_display: String,
+    },
+}
+
+impl RecommendationTitle {
+    fn into_string(self) -> String {
+        match self {
+            Self::Text(text) => text,
+            Self::Localized { string_for_display } => string_for_display,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RecommendationRelationships {
+    pub contents: Option<ShelfContents>,
+}
+
+/// `contents`: albums, playlists, and sometimes stations, in one list.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ShelfContents {
+    #[serde(default)]
+    pub data: Vec<ContentResource>,
+}
+
+/// One entry of a shelf, of whatever kind Apple chose to put there.
+///
+/// Typed only enough to dispatch on `type`, then converted into the shape that
+/// kind actually has. **Not an internally tagged enum**, because an unknown
+/// kind — a music video, or whatever Apple adds next — must cost one dropped
+/// tile rather than failing the parse of the whole shelf.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ContentResource {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    pub id: String,
+    #[serde(default)]
+    pub attributes: Option<serde_json::Value>,
+}
+
+impl ContentResource {
+    /// `None` for a kind Home has no tile for.
+    fn into_item(self) -> Option<ShelfItem> {
+        let ContentResource {
+            kind,
+            id,
+            attributes,
+        } = self;
+        let Some(attributes) = attributes else {
+            tracing::warn!(%kind, %id, "a Home tile carried no attributes");
+            return None;
+        };
+        let item = match kind.as_str() {
+            "albums" => serde_json::from_value::<AlbumAttributes>(attributes)
+                .map(|a| {
+                    Album::from(Resource {
+                        id: id.clone(),
+                        attributes: Some(a),
+                        relationships: None,
+                    })
+                })
+                .map(ShelfItem::Album),
+            "playlists" => serde_json::from_value::<PlaylistAttributes>(attributes)
+                .map(|a| {
+                    Playlist::from(Resource {
+                        id: id.clone(),
+                        attributes: Some(a),
+                        relationships: None,
+                    })
+                })
+                .map(ShelfItem::Playlist),
+            "stations" => serde_json::from_value::<StationAttributes>(attributes)
+                .map(|a| {
+                    Station::from(Resource {
+                        id: id.clone(),
+                        attributes: Some(a),
+                        relationships: None,
+                    })
+                })
+                .map(ShelfItem::Station),
+            other => {
+                // Named rather than counted: "Home is missing a shelf" and "one
+                // tile of a shelf was a music video" are different bugs.
+                tracing::warn!(kind = other, %id, "dropping a Home tile of a kind we cannot draw");
+                return None;
+            }
+        };
+        match item {
+            Ok(item) => Some(item),
+            Err(err) => {
+                tracing::warn!(?err, %id, %kind, "could not read a Home tile");
+                None
+            }
+        }
+    }
+}
+
+impl RecommendationResource {
+    /// A shelf, or `None` for one with nothing drawable in it, or no title.
+    ///
+    /// An empty heading is worse than no heading: it claims Apple recommended
+    /// something and then shows a blank row.
+    pub fn into_shelf(self) -> Option<Shelf> {
+        let attributes = self.attributes.unwrap_or_default();
+        let title = attributes
+            .title
+            .map(RecommendationTitle::into_string)
+            .unwrap_or_default();
+        let items: Vec<ShelfItem> = self
+            .relationships
+            .and_then(|r| r.contents)
+            .map(|contents| {
+                contents
+                    .data
+                    .into_iter()
+                    .filter_map(ContentResource::into_item)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if items.is_empty() {
+            tracing::debug!(
+                %title,
+                id = %self.id,
+                "skipping a Home shelf with nothing in it"
+            );
+            return None;
+        }
+        if title.is_empty() {
+            tracing::debug!(id = %self.id, "skipping a Home shelf with no title");
+            return None;
+        }
+        Some(Shelf {
+            title,
+            next_update: attributes.next_update_date,
+            items,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StationAttributes {
+    #[serde(default)]
+    pub name: String,
+    pub artwork: Option<ArtworkAttributes>,
+    pub description: Option<DescriptionAttribute>,
+    /// For a station this is `{id: "ra.…", kind: "radioStation"}` and carries
+    /// **no** `catalogId` — which is what makes it unusable as a `Track`.
+    pub play_params: Option<PlayParams>,
+}
+
+impl From<Resource<StationAttributes>> for Station {
+    fn from(res: Resource<StationAttributes>) -> Self {
+        let attributes = res.attributes;
+        // `playParams.id` is the id that plays; the resource's own id is the
+        // same `ra.…` when Apple omits it. Kept as a fallback rather than
+        // preferred, because the two disagreeing is exactly the sort of thing
+        // that only shows up as "the station will not start".
+        let id = attributes
+            .as_ref()
+            .and_then(|a| a.play_params.as_ref())
+            .map(|p| p.id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or(res.id);
+        Station {
+            id,
+            name: attributes
+                .as_ref()
+                .map(|a| a.name.clone())
+                .unwrap_or_default(),
+            description: attributes
+                .as_ref()
+                .and_then(|a| a.description.as_ref())
+                .map(|d| d.standard.clone())
+                .unwrap_or_default(),
+            artwork: attributes
+                .and_then(|a| a.artwork)
+                .filter(|art| !art.url.is_empty())
+                .map(|art| Artwork::new(art.url)),
         }
     }
 }
@@ -904,5 +1154,42 @@ mod tests {
         assert_eq!(playlist.curator, "Apple Music");
         assert_eq!(playlist.description, "The songs everyone is playing.");
         assert!(playlist.artwork.is_some());
+    }
+
+    fn shelf(raw: &str) -> Option<Shelf> {
+        serde_json::from_str::<RecommendationResource>(raw)
+            .unwrap()
+            .into_shelf()
+    }
+
+    #[test]
+    fn replay_keeps_its_years_and_drops_the_editorial_card() {
+        // Apple's "Replay: Your Top Music" shelf leads with an editorial card
+        // Home has no tile for, then one playlist per year.
+        let replay = shelf(
+            r#"{"id":"23-x","attributes":{"title":{"stringForDisplay":"Replay: Your Top Music"}},
+              "relationships":{"contents":{"data":[
+                {"type":"editorial-items","id":"6444321639","attributes":{}},
+                {"type":"playlists","id":"pl.rp-pEEBClwO0E","attributes":{"name":"Replay 2015"}},
+                {"type":"playlists","id":"pl.rp-gQQ8HPgVyZ","attributes":{"name":"Replay 2022"}}]}}}"#,
+        )
+        .expect("the playlists make it a shelf");
+        assert_eq!(replay.title, "Replay: Your Top Music");
+        assert_eq!(replay.items.len(), 2);
+        assert!(matches!(&replay.items[0], ShelfItem::Playlist(p) if p.id == "pl.rp-pEEBClwO0E"));
+    }
+
+    #[test]
+    fn an_untitled_shelf_is_not_drawn() {
+        // The listen-now feed carries a one-tile banner with no title at all.
+        // Drawn, it is a strip under an empty heading.
+        assert!(
+            shelf(
+                r#"{"id":"15-x","attributes":{"nextUpdateDate":"2026-10-26T00:00:00Z"},
+                  "relationships":{"contents":{"data":[
+                    {"type":"playlists","id":"pl.1","attributes":{"name":"Antidote"}}]}}}"#,
+            )
+            .is_none()
+        );
     }
 }

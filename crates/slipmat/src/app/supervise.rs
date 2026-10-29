@@ -10,7 +10,7 @@
 
 use relm4::ComponentSender;
 
-use super::{AppModel, CommandMsg, Stage};
+use super::{AppModel, CommandMsg, Stage, View};
 use crate::daemon;
 use slipmat_core::ipc::{Event, Request, Stage as DaemonStage, Transport};
 
@@ -25,6 +25,16 @@ fn redial_delay(attempt: u32) -> std::time::Duration {
 
 fn clears_account_state(stage: &DaemonStage) -> bool {
     matches!(stage, DaemonStage::SignedOut)
+}
+
+/// Whether a readiness that has just arrived means Home should be asked again.
+///
+/// The daemon only answers with nothing when it has nothing: before it is ready
+/// that is the whole answer, and the client would otherwise have marked Home as
+/// tried and never asked again. A stage event is not sent on a failed fetch, so
+/// this cannot paper over a real failure — `Event::Error` does that.
+fn should_reask_home(stage: &Stage, home_empty: bool) -> bool {
+    matches!(stage, Stage::Ready) && home_empty
 }
 
 pub(super) fn connect(sender: &ComponentSender<AppModel>) {
@@ -89,6 +99,12 @@ impl AppModel {
                 self.ask(Request::Stage);
                 self.ask(Request::Snapshot);
                 self.ask(Request::Queue);
+                // Home is not asked for on every connect — only when it is
+                // what the window is showing, so a client that lives in the
+                // library never costs Apple a recommendations call.
+                if self.view == View::Home && !self.tried_home {
+                    self.ask_home();
+                }
             }
             daemon::Incoming::Event(event) => self.on_event(*event, sender),
             daemon::Incoming::Unparsed(line) => {
@@ -144,6 +160,17 @@ impl AppModel {
                 if clear {
                     self.forget_session(sender);
                 }
+                // The daemon answers Home with what it has, and before it is
+                // ready that is nothing at all. So a stage that becomes ready
+                // after the window opened is the moment to ask again —
+                // otherwise Home sits on "nothing to recommend" until somebody
+                // presses Reload.
+                if should_reask_home(&self.stage, self.home.is_empty()) {
+                    self.tried_home = false;
+                    if self.view == View::Home {
+                        self.ask_home();
+                    }
+                }
             }
             Event::LibraryChanged => {
                 tracing::info!("the daemon refreshed the library");
@@ -169,7 +196,15 @@ impl AppModel {
                 // and does its own filtering, sorting and grids, which is
                 // presentation rather than something to ask across a socket.
             }
-            Event::Error { detail } => self.toast(&detail),
+            Event::Home { shelves } => self.fill_home(shelves, sender),
+            Event::Error { detail } => {
+                // **A toast does not stop a spinner.** A Home fetch that failed
+                // outright answers with an error as well as an empty `Home`,
+                // and a daemon too old to know `Request::Home` answers with
+                // this error alone — either way, waiting is over.
+                self.loading_home = false;
+                self.toast(&detail);
+            }
         }
     }
 
@@ -184,6 +219,17 @@ impl AppModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_is_asked_again_only_once_the_daemon_is_ready() {
+        // Before `Ready` there is nothing to ask with, and the answer the
+        // client already got was "not yet".
+        assert!(!should_reask_home(&Stage::Starting, true));
+        assert!(!should_reask_home(&Stage::Connecting, true));
+        assert!(should_reask_home(&Stage::Ready, true));
+        // Shelves already on screen are not worth a second request.
+        assert!(!should_reask_home(&Stage::Ready, false));
+    }
 
     #[test]
     fn only_confirmed_signed_out_stage_clears_account_state() {
