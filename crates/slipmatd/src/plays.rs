@@ -32,6 +32,8 @@ struct Current {
     /// Which queue entry this is. A song queued twice is two entries.
     key: String,
     item: Item,
+    /// Began by going round rather than by becoming current.
+    again: bool,
     started_at: Option<i64>,
     position_ms: u64,
     listened_ms: u64,
@@ -57,7 +59,11 @@ impl Listening {
         if key.is_some() && key == self.current.as_ref().map(|c| c.key.clone()) {
             return None;
         }
-        let ended = self.finish();
+        let ended = self
+            .current
+            .take()
+            .filter(|c| !c.was_the_boundary())
+            .and_then(Current::into_play);
         self.current = item.map(Current::new);
         ended
     }
@@ -65,7 +71,10 @@ impl Listening {
     fn tick(&mut self, position_ms: u64, now: i64) -> Option<Play> {
         let current = self.current.as_ref()?;
         let ended = if current.went_round(position_ms) {
-            let again = Current::new(&current.item);
+            let again = Current {
+                again: true,
+                ..Current::new(&current.item)
+            };
             self.current.replace(again).and_then(Current::into_play)
         } else {
             None
@@ -95,6 +104,7 @@ impl Current {
         Self {
             key: key(item),
             item: item.clone(),
+            again: false,
             started_at: None,
             position_ms: 0,
             listened_ms: 0,
@@ -110,12 +120,20 @@ impl Current {
         self.position_ms = position_ms;
     }
 
-    /// Back at the start from the end, on the same queue entry: repeat-one.
+    /// Back at the start from the end, on the same queue entry: repeat-one,
+    /// or the end of the song as MusicKit reports it (see `was_the_boundary`).
     fn went_round(&self, position_ms: u64) -> bool {
         self.listened_ms > 0
             && self.item.duration_ms > 0
             && position_ms < STEP_MS
             && self.position_ms + STEP_MS >= self.item.duration_ms
+    }
+
+    /// MusicKit starts the next song's clock a moment before it says the song
+    /// changed. A replay that another song replaced within one step was that
+    /// moment, not a replay.
+    fn was_the_boundary(&self) -> bool {
+        self.again && self.listened_ms <= STEP_MS
     }
 
     fn into_play(self) -> Option<Play> {
@@ -264,5 +282,16 @@ mod tests {
         assert_eq!(first.listened_ms, 500);
         let second = listening.finish().expect("the second time round");
         assert_eq!((second.played_at, second.listened_ms), (10, 800));
+    }
+
+    #[test]
+    fn a_song_running_into_the_next_is_one_play() {
+        // The last half second, the next song's first second, then the change.
+        let mut listening = Listening::default();
+        now_playing(&mut listening, &item("run:1", "Awake"));
+        ticks(&mut listening, 0, &[SONG_MS - 1_000, SONG_MS - 500]);
+        let heard = ticks(&mut listening, 10, &[0, 1_000]).expect("a play");
+        assert_eq!(heard.title, "Awake");
+        assert_eq!(now_playing(&mut listening, &item("run:2", "Montana")), None);
     }
 }
