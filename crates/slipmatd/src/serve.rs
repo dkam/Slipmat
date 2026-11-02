@@ -104,6 +104,11 @@ pub struct Daemon {
     /// Rung by [`Request::Quit`], and answered where SIGTERM is — so leaving on
     /// purpose and being stopped by a service manager take the same path.
     pub quitting: tokio::sync::Notify,
+    /// The song being heard now, until something else is current.
+    pub listening: RefCell<crate::plays::Listening>,
+    /// Where finished plays go. `None` when the file could not be opened, and
+    /// in tests, which must never write to the listener's own history.
+    pub history: Option<slipmat_core::plays::Store>,
 }
 
 impl Daemon {
@@ -208,6 +213,10 @@ pub async fn run() -> Result<()> {
         wake: tokio::sync::Notify::new(),
         quitting: tokio::sync::Notify::new(),
         mixer: crate::mixer::Mixer::start(),
+        listening: RefCell::default(),
+        history: slipmat_core::plays::Store::open()
+            .inspect_err(|err| tracing::warn!("plays will not be recorded: {err:#}"))
+            .ok(),
     });
 
     // After the `Rc` exists: MPRIS holds one so a button on a bar can reach the
@@ -302,6 +311,7 @@ pub async fn run() -> Result<()> {
             // Written first: after this the mirror is the only record of what
             // was loaded, and it is about to be emptied.
             save_session(&idling);
+            crate::plays::finish(&idling);
             idling.idle.set(true);
             // Dropping the handle closes the child's stdin, which is the
             // shutdown signal `main.js` waits on; `kill_on_drop` is the backstop.
@@ -335,6 +345,7 @@ pub async fn run() -> Result<()> {
         };
         tracing::info!(why, "shutting down");
         save_session(&leaving);
+        crate::plays::finish(&leaving);
         // The socket outlives the process that made it, and a leftover one
         // answers for a daemon that is not running.
         let _ = std::fs::remove_file(&socket);
@@ -375,6 +386,7 @@ pub async fn run() -> Result<()> {
         // Written from the live mirror, not from what was on disk: a crash
         // mid-track should come back to that track, not to last night's.
         save_session(&daemon);
+        crate::plays::finish(&daemon);
 
         // Put down on purpose: wait to be asked rather than backing off, and do
         // not count it as a failure.
@@ -612,6 +624,7 @@ fn on_event(daemon: &Rc<Daemon>, event: PlayerEvent) {
         PlayerEvent::Queue(_) | PlayerEvent::NowPlaying { .. }
     );
     daemon.model.borrow_mut().player.apply(&event);
+    crate::plays::observe(daemon, &event);
 
     if queue_changed {
         restore_queue_selection(daemon);
@@ -1535,6 +1548,8 @@ mod tests {
             wake: tokio::sync::Notify::new(),
             mixer: None,
             quitting: tokio::sync::Notify::new(),
+            listening: RefCell::default(),
+            history: None,
         })
     }
 

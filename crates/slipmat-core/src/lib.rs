@@ -16,6 +16,7 @@ pub mod mpris;
 pub mod music;
 pub mod paths;
 pub mod player;
+pub mod plays;
 pub mod queue;
 pub mod session;
 pub mod sort;

@@ -14,6 +14,7 @@ libc = "0.2"
 mpris-server = "0.10"
 
 reqwest.workspace = true
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "fallible_uint"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
