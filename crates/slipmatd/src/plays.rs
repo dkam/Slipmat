@@ -13,8 +13,10 @@
 //! Every play is recorded, skips included. Whether one *counts* is a question
 //! for whoever reads the history, so the rule can change without the rows.
 
+use slipmat_core::ipc::Event;
+use slipmat_core::music::types::Artwork;
 use slipmat_core::player::protocol::{Event as PlayerEvent, Item};
-use slipmat_core::plays::Play;
+use slipmat_core::plays::{Play, Source};
 
 use crate::serve::Daemon;
 
@@ -145,6 +147,8 @@ impl Current {
             album: self.item.album,
             duration_ms: self.item.duration_ms,
             listened_ms: self.listened_ms,
+            source: Source::Here,
+            artwork: self.item.artwork_template.map(Artwork::new),
         })
     }
 }
@@ -171,11 +175,14 @@ fn keep(daemon: &Daemon, play: &Play) {
         return;
     };
     match history.record(play) {
-        Ok(()) => tracing::debug!(
-            title = %play.title,
-            listened_ms = play.listened_ms,
-            "play recorded"
-        ),
+        Ok(()) => {
+            tracing::debug!(
+                title = %play.title,
+                listened_ms = play.listened_ms,
+                "play recorded"
+            );
+            daemon.publish(Event::PlaysChanged);
+        }
         Err(err) => tracing::warn!("could not record a play: {err:#}"),
     }
 }
@@ -282,6 +289,23 @@ mod tests {
         assert_eq!(first.listened_ms, 500);
         let second = listening.finish().expect("the second time round");
         assert_eq!((second.played_at, second.listened_ms), (10, 800));
+    }
+
+    #[test]
+    fn a_play_keeps_its_cover_and_says_it_was_heard_here() {
+        let mut listening = Listening::default();
+        let awake = Item {
+            artwork_template: Some("https://example.com/{w}x{h}bb.jpg".into()),
+            ..item("run:1", "Awake")
+        };
+        now_playing(&mut listening, &awake);
+        ticks(&mut listening, 0, &[500, 1_000]);
+        let play = listening.finish().expect("a play");
+        assert_eq!(play.source, Source::Here);
+        assert_eq!(
+            play.artwork,
+            Some(Artwork::new("https://example.com/{w}x{h}bb.jpg"))
+        );
     }
 
     #[test]

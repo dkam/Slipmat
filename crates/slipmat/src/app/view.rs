@@ -29,6 +29,7 @@ pub enum View {
     Songs,
     Albums,
     Artists,
+    History,
     Playlists,
 }
 
@@ -56,7 +57,7 @@ pub(super) struct Row {
 /// "select this" and "clear that".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SidebarRow {
-    /// One of the five fixed sections.
+    /// One of the fixed sections.
     Section(View),
     /// A pinned playlist, by **library** id. The name is looked up when the row
     /// is built, so a pin costs nothing to store and cannot go out of date.
@@ -80,6 +81,14 @@ pub(super) fn sidebar_rows(pins: &[String]) -> Vec<SidebarRow> {
         .collect()
 }
 
+/// The heading over a sidebar row, if that row starts a group. The rows below
+/// the sections are pins, which belong to the last group and start nothing.
+pub(super) fn heading_at(index: usize) -> Option<&'static str> {
+    let group = View::SIDEBAR.get(index)?.view.group();
+    let starts = index == 0 || View::SIDEBAR[index - 1].view.group() != group;
+    starts.then_some(group)
+}
+
 /// Where a section sits, for selecting the persisted one at startup.
 pub(super) fn section_index(rows: &[SidebarRow], view: View) -> Option<i32> {
     rows.iter()
@@ -95,7 +104,7 @@ impl View {
     ///
     /// The label is not [`View::title`]: the row says "Search" under a heading
     /// that says "Apple Music", and the narrow header has no heading to lean on.
-    pub(super) const SIDEBAR: [Row; 5] = [
+    pub(super) const SIDEBAR: [Row; 6] = [
         Row {
             view: Self::Search,
             icon: "system-search-symbolic",
@@ -117,6 +126,11 @@ impl View {
             label: "Artists",
         },
         Row {
+            view: Self::History,
+            icon: "document-open-recent-symbolic",
+            label: "History",
+        },
+        Row {
             view: Self::Playlists,
             // A grid, because that is what the row opens — and it sets the row
             // apart from the pins below it, which are lists.
@@ -131,6 +145,17 @@ impl View {
             label: "All",
         },
     ];
+
+    /// Which sidebar group a section belongs to, and what its heading says.
+    /// Library is what you own; Listening is what you did.
+    fn group(self) -> &'static str {
+        match self {
+            Self::Search => "Apple Music",
+            Self::Songs | Self::Albums | Self::Artists => "Library",
+            Self::History => "Listening",
+            Self::Playlists => "Playlists",
+        }
+    }
 
     pub(super) fn scope(self) -> SearchScope {
         match self {
@@ -150,6 +175,7 @@ impl View {
             Self::Songs => "Songs",
             Self::Albums => "Albums",
             Self::Artists => "Artists",
+            Self::History => "History",
             Self::Playlists => "Playlists",
         }
     }
@@ -161,6 +187,7 @@ impl From<Section> for View {
             Section::Library => Self::Songs,
             Section::Albums => Self::Albums,
             Section::Artists => Self::Artists,
+            Section::History => Self::History,
             Section::Playlists => Self::Playlists,
             Section::Catalog => Self::Search,
         }
@@ -173,6 +200,7 @@ impl From<View> for Section {
             View::Songs => Self::Library,
             View::Albums => Self::Albums,
             View::Artists => Self::Artists,
+            View::History => Self::History,
             View::Playlists => Self::Playlists,
             View::Search => Self::Catalog,
         }
@@ -268,13 +296,14 @@ impl View {
     ///
     /// **Search is the songs list showing other results**, so it sorts like
     /// one — and the wire's `View` has no Search of its own, because the daemon
-    /// browses a library rather than a screen.
+    /// browses a library rather than a screen. History has no sort button at
+    /// all: it runs in the order it happened.
     pub fn sortable(self) -> slipmat_core::ipc::View {
         match self {
             Self::Albums => slipmat_core::ipc::View::Albums,
             Self::Artists => slipmat_core::ipc::View::Artists,
             Self::Playlists => slipmat_core::ipc::View::Playlists,
-            Self::Songs | Self::Search => slipmat_core::ipc::View::Songs,
+            Self::Songs | Self::Search | Self::History => slipmat_core::ipc::View::Songs,
         }
     }
 }
@@ -321,6 +350,7 @@ impl AppModel {
                 self.built_rows = None;
                 self.rebuild_rows();
             }
+            View::History => {}
         }
     }
 }
@@ -362,7 +392,7 @@ impl Sorts {
             View::Albums => self.albums,
             View::Artists => self.artists,
             View::Playlists => self.playlists,
-            View::Songs | View::Search => self.songs,
+            View::Songs | View::Search | View::History => self.songs,
         }
     }
 
@@ -371,7 +401,7 @@ impl Sorts {
             View::Albums => &mut self.albums,
             View::Artists => &mut self.artists,
             View::Playlists => &mut self.playlists,
-            View::Songs | View::Search => &mut self.songs,
+            View::Songs | View::Search | View::History => &mut self.songs,
         };
         *slot = sort;
     }
@@ -506,6 +536,25 @@ mod tests {
     }
 
     #[test]
+    fn each_group_has_its_heading_on_its_first_row() {
+        let headings: Vec<_> = (0..View::SIDEBAR.len() + 2).map(heading_at).collect();
+        assert_eq!(
+            headings,
+            [
+                Some("Apple Music"),
+                Some("Library"),
+                None,
+                None,
+                Some("Listening"),
+                Some("Playlists"),
+                // Pins sit under Playlists and start nothing of their own.
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
     fn a_position_outside_the_list_names_no_row() {
         // `ListBox` reports a selection while rows are being rebuilt under it,
         // so an out-of-range position is ordinary rather than exceptional. It
@@ -523,6 +572,7 @@ mod tests {
             View::Songs,
             View::Albums,
             View::Artists,
+            View::History,
             View::Playlists,
         ] {
             assert_eq!(View::from(Section::from(view)), view);
@@ -532,7 +582,13 @@ mod tests {
     #[test]
     fn only_search_looks_at_the_catalog() {
         assert_eq!(View::Search.scope(), SearchScope::Catalog);
-        for view in [View::Songs, View::Albums, View::Artists, View::Playlists] {
+        for view in [
+            View::Songs,
+            View::Albums,
+            View::Artists,
+            View::History,
+            View::Playlists,
+        ] {
             assert_eq!(view.scope(), SearchScope::Library);
         }
     }

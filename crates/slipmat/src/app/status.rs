@@ -58,6 +58,7 @@ impl AppModel {
             View::Albums => !self.albums.is_empty() || self.loading_albums,
             View::Artists => !self.artists.is_empty() || self.loading_artists,
             View::Playlists => !self.playlists.is_empty() || self.loading_playlists,
+            View::History => !self.plays.is_empty(),
             _ => !self.all_tracks.is_empty(),
         }
     }
@@ -88,6 +89,7 @@ impl AppModel {
             View::Artists => self.loading_artists,
             View::Playlists => self.loading_playlists,
             View::Songs | View::Search => self.loading_library,
+            View::History => false,
         }
     }
 
@@ -123,6 +125,7 @@ impl AppModel {
             View::Albums => "Loading your albums",
             View::Artists => "Loading your artists",
             View::Playlists => "Loading your playlists",
+            View::History => "Loading your history",
             View::Songs => "Loading your library",
         }
         .into()
@@ -192,6 +195,15 @@ impl AppModel {
                     empty_library_page(&self.library_query)
                 } else {
                     "playlists"
+                }
+            }
+            View::History => {
+                if !self.history.is_empty() {
+                    "history"
+                } else if self.library_query.trim().is_empty() {
+                    "history-empty"
+                } else {
+                    "no-results"
                 }
             }
             View::Search => {

@@ -265,6 +265,37 @@ pub fn set_accent(accent: Accent) {
             Named for what they do rather than for the queue: two lists reorder
             now, and a second copy of these three rules would be two places to
             change the colour. */
+         /* libadwaita has no chip that is not a button. */
+         .source-chip {{
+             padding: 2px 8px;
+             border-radius: 9999px;
+             background-color: alpha(currentColor, 0.13);
+         }}
+         .source-dot {{
+             min-width: 6px;
+             min-height: 6px;
+             border-radius: 9999px;
+             background-color: var(--accent-color);
+         }}
+
+         /* Quiet until pointed at, or every row is a line of underlines. The
+            dimming is a colour rather than `.dim-label`, whose opacity would
+            take the accent down with it. */
+         .history-links {{ color: alpha(currentColor, 0.55); }}
+         .history-link,
+         .history-link:hover,
+         .history-link:active {{
+             min-height: 0;
+             min-width: 0;
+             padding: 0;
+             background: none;
+             box-shadow: none;
+             color: inherit;
+             font-weight: inherit;
+         }}
+         .history-link:hover {{ color: var(--accent-color); }}
+         .history-link:hover > label {{ text-decoration: underline; }}
+
          .drop-above {{ box-shadow: inset 0 2px 0 var(--accent-bg-color); }}
          .drop-below {{ box-shadow: inset 0 -2px 0 var(--accent-bg-color); }}
          .dragging {{ opacity: 0.35; }}

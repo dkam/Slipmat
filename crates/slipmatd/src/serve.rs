@@ -1704,6 +1704,44 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_play_tells_clients_the_history_changed() {
+        let Ok(mut daemon) = Rc::try_unwrap(daemon()) else {
+            unreachable!("nothing else holds a daemon made a moment ago");
+        };
+        daemon.history = Some(slipmat_core::plays::Store::in_memory().unwrap());
+        let mut events = daemon.events.subscribe();
+        let awake = Item {
+            occurrence_id: "run:1".into(),
+            title: "Awake".into(),
+            duration_ms: 200_000,
+            ..Default::default()
+        };
+
+        crate::plays::observe(
+            &daemon,
+            &PlayerEvent::NowPlaying {
+                item: Some(awake),
+                queue: Default::default(),
+            },
+        );
+        for position_ms in [500, 1_000] {
+            crate::plays::observe(
+                &daemon,
+                &PlayerEvent::Position {
+                    position_ms,
+                    duration_ms: 200_000,
+                },
+            );
+        }
+        assert!(events.try_recv().is_err(), "nothing has finished yet");
+        crate::plays::finish(&daemon);
+
+        assert!(matches!(events.try_recv(), Ok(Event::PlaysChanged)));
+        let recorded = daemon.history.as_ref().unwrap().recent(10).unwrap();
+        assert_eq!(recorded[0].title, "Awake");
+    }
+
+    #[test]
     fn a_changed_library_is_persisted_then_published_once() {
         let daemon = daemon();
         daemon.model.borrow_mut().library = crate::library::Library::default();

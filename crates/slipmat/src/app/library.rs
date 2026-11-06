@@ -111,6 +111,7 @@ impl AppModel {
             View::Artists => self.rebuild_artists(),
             View::Playlists => self.rebuild_playlists(),
             View::Songs | View::Search => self.rebuild_rows(),
+            View::History => self.rebuild_history(),
         }
     }
 

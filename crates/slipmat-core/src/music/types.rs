@@ -112,6 +112,11 @@ impl Artwork {
             .replace("{c}", "bb")
     }
 
+    /// The template itself, for a store that keeps it rather than a URL.
+    pub fn template(&self) -> &str {
+        &self.template
+    }
+
     /// Cache key: stable per template, independent of requested size.
     pub fn cache_key(&self) -> String {
         // FNV-1a. Small, dependency-free, and we only need a filename — this is

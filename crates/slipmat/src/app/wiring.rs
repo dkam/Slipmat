@@ -39,10 +39,7 @@ pub(super) fn connect(
 ) {
     sidebar_rows(model, widgets, sender);
     sidebar_selection(model, widgets, sender);
-    sidebar_headers(
-        widgets,
-        super::view::section_index(&model.sidebar_rows, View::Playlists).unwrap_or_default(),
-    );
+    sidebar_headers(widgets);
     sort_menu(model, widgets, sender);
     catalog_filter_menu(model, widgets, sender);
     open_on_last_section(model, widgets);
@@ -56,7 +53,7 @@ pub(super) fn connect(
     model.volume_osd.sit_below_the_header(&widgets.content_bars);
 }
 
-/// Build the sidebar's five rows from [`View::SIDEBAR`].
+/// Build the sidebar's rows from [`View::SIDEBAR`].
 ///
 /// They were five near-identical `ListBoxRow`s in `view!` — 126 lines saying
 /// one thing five times, each carrying a comment repeating its own index.
@@ -68,7 +65,7 @@ pub(super) fn connect(
 /// by `sync_section_spinners`.
 fn sidebar_rows(model: &mut AppModel, widgets: &Widgets, sender: &ComponentSender<AppModel>) {
     // A pin's position among the *pins*, which is what a reorder moves — not its
-    // position among the rows, which counts the five sections above it.
+    // position among the rows, which counts the sections above it.
     let mut pin_index = 0usize;
     for entry in model.sidebar_rows.clone() {
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -102,10 +99,11 @@ fn sidebar_rows(model: &mut AppModel, widgets: &Widgets, sender: &ComponentSende
         content.append(&label);
 
         // Apple Music has nothing of its own to load: a catalog search reports
-        // through the content pane, not through a sidebar row. A pin has no
-        // spinner either — it opens a page, which carries its own.
+        // through the content pane, not through a sidebar row. Nor has History,
+        // which is a file on this machine. A pin has no spinner either — it
+        // opens a page, which carries its own.
         if let SidebarRow::Section(view) = entry
-            && view != View::Search
+            && !matches!(view, View::Search | View::History)
         {
             let spinner = adw::Spinner::new();
             spinner.set_size_request(16, 16);
@@ -226,16 +224,15 @@ fn section_row(view: View) -> &'static super::view::Row {
 /// The headings drawn above the row that starts each group.
 ///
 /// One `ListBox` with a header func, never one box per group — see the note in
-/// `view!` and 285b542. `playlists_row` is passed rather than hard-coded so the
-/// heading follows the row if the sections are ever reordered; everything below
-/// that row is a pin, which is why Playlists is the last group.
-fn sidebar_headers(widgets: &Widgets, playlists_row: i32) {
+/// `view!` and 285b542. Everything below the sections is a pin, which is why
+/// Playlists is the last group.
+fn sidebar_headers(widgets: &Widgets) {
     widgets.nav_list.set_header_func(move |row, _before| {
-        let title = match row.index() {
-            0 => "Apple Music",
-            1 => "Library",
-            index if index == playlists_row => "Playlists",
-            _ => return,
+        let Some(title) = usize::try_from(row.index())
+            .ok()
+            .and_then(super::view::heading_at)
+        else {
+            return;
         };
         let label = gtk::Label::new(Some(title));
         label.set_xalign(0.0);
@@ -500,6 +497,11 @@ fn library_list_properties(model: &AppModel, widgets: &Widgets) {
     widgets.library_clamp.set_child(Some(list));
     list.set_single_click_activate(true);
     list.add_css_class("navigation-sidebar");
+
+    let history = &model.history.view;
+    widgets.history_clamp.set_child(Some(history));
+    history.set_single_click_activate(true);
+    history.add_css_class("navigation-sidebar");
 }
 
 fn bottom_bar_inset(widgets: &Widgets) {

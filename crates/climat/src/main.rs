@@ -824,6 +824,8 @@ impl App {
             Event::LibraryRefreshing { refreshing } => {
                 self.refreshing_library = refreshing;
             }
+            // No history view here yet.
+            Event::PlaysChanged => {}
             // The daemon refuses things — removing the track it is playing is
             // the one that will be hit most. Saying so is rule 4's job.
             Event::Error { detail } => self.message = Some(Notice::bad(detail)),

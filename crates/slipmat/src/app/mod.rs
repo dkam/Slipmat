@@ -44,6 +44,7 @@ use relm4::typed_view::list::TypedListView;
 use crate::components::artwork::{self, ART_SIZE};
 use crate::components::detail_page::{DetailPage, PageKind};
 use crate::components::grid_item::{ArtRegistry, ArtRequest, GridItem, Tile, art_registry};
+use crate::components::history_row::{HistoryItem, Link, OpenLink, Row as HistoryRow};
 use crate::components::now_playing::{NowPlaying, NowPlayingInput, NowPlayingOutput, VOLUME_STEP};
 use crate::components::player_view::{PlayerView, PlayerViewInput};
 use crate::components::queue_view::{QueueView, QueueViewInput, QueueViewOutput};
@@ -60,6 +61,7 @@ use crate::settings::{Section, Settings, Theme};
 use slipmat_core::ipc::{PlayMode, Request, Transport, WriteAction};
 use slipmat_core::music::types::{Album, Artist, Artwork, Playlist, Track};
 use slipmat_core::player::protocol::RepeatMode;
+use slipmat_core::plays::Play;
 
 /// How often the seek bar redraws while playing.
 ///
@@ -69,6 +71,7 @@ use slipmat_core::player::protocol::RepeatMode;
 /// should cost nothing (the same discipline as Pitwall's suspend-gated poll).
 mod background;
 mod chrome;
+mod history;
 mod library;
 mod osd;
 mod pages;
@@ -156,6 +159,15 @@ pub struct AppModel {
     /// The rows on screen — the filtered view. A `ListView`, so its cost is
     /// the number of rows visible rather than the size of the library.
     library: TypedListView<LibraryItem, gtk::NoSelection>,
+    /// The plays as last read, newest first, whatever the search box says.
+    plays: Vec<Play>,
+    /// What the history list holds, for asking which row is which.
+    history_rows: Vec<HistoryRow>,
+    history: TypedListView<HistoryItem, gtk::NoSelection>,
+    /// A registry of its own, for the reason each grid has one.
+    history_art_widgets: ArtRegistry,
+    /// Handed to every history row: "open this song's album or artist."
+    open_history_link: OpenLink,
     /// Whether the queue sidebar is open.
     show_queue: bool,
     /// Whether the navigation sidebar is open. Persisted, like the section:
@@ -578,10 +590,12 @@ pub enum AppMsg {
     /// A separate message from `OpenPage` because a queue item has no album or
     /// artist id to push a page with — only the song's own. Resolving that costs
     /// a request, which is why it happens on a menu click and not per row.
-    OpenQueueTrackPage {
+    OpenTrackPage {
         catalog_id: String,
         album: bool,
     },
+    /// A row of History was clicked: a play to replay from, or a heading.
+    HistoryActivated(u32),
     /// The navigation view popped a page — drop the state behind it.
     PagePopped(u64),
     /// Act on a track in MusicKit's queue, by id. The position is resolved
@@ -601,6 +615,8 @@ pub enum AppMsg {
 pub enum CommandMsg {
     /// The quit request reached the daemon socket, so the client can exit.
     QuitWritten,
+    /// The plays as they stand on disk, or why they could not be read.
+    History(Result<Vec<Play>, String>),
     /// Everything the daemon pushed down, including losing it.
     Daemon(daemon::Incoming),
     /// Cover art is on disk. `None` when the fetch failed — a missing cover is
@@ -931,6 +947,7 @@ impl Component for AppModel {
                                                     View::Songs => "Search your library",
                                                     View::Albums => "Search albums",
                                                     View::Artists => "Search artists",
+                                                    View::History => "Search your history",
                                                     View::Playlists => "Search playlists",
                                                     View::Search => "Search Apple Music",
                                                 }),
@@ -1015,8 +1032,13 @@ impl Component for AppModel {
                                             // Apple ranked those results and
                                             // re-ordering them locally would
                                             // throw away the ranking without
-                                            // being able to reproduce it.
-                                            set_visible: model.view != View::Search,
+                                            // being able to reproduce it. And
+                                            // History runs in the order it
+                                            // happened.
+                                            set_visible: !matches!(
+                                                model.view,
+                                                View::Search | View::History
+                                            ),
                                             // Visibility follows the section,
                                             // which says nothing about whether
                                             // there is a list to reorder yet.
@@ -1098,6 +1120,27 @@ impl Component for AppModel {
                                                 set_maximum_size: 800,
                                                 add_css_class: "plain-scroller",
                                             },
+                                        },
+
+                                        add_named[Some("history")] = &gtk::ScrolledWindow {
+                                            set_vexpand: true,
+                                            set_hscrollbar_policy: gtk::PolicyType::Never,
+                                            add_css_class: "plain-scroller",
+
+                                            #[wrap(Some)]
+                                            #[name = "history_clamp"]
+                                            set_child = &adw::ClampScrollable {
+                                                set_maximum_size: 800,
+                                                add_css_class: "plain-scroller",
+                                            },
+                                        },
+
+                                        add_named[Some("history-empty")] = &adw::StatusPage {
+                                            set_icon_name: Some("document-open-recent-symbolic"),
+                                            set_title: "Nothing played yet",
+                                            set_description: Some(
+                                                "What you play in Slipmat shows up here.",
+                                            ),
                                         },
 
                                         // Grids scroll as themselves: unlike the
@@ -1198,6 +1241,10 @@ impl Component for AppModel {
                                                     "No artist in your library matches “{}”.",
                                                     model.query()
                                                 ),
+                                                View::History => format!(
+                                                    "Nothing you played matches “{}”.",
+                                                    model.query()
+                                                ),
                                                 View::Playlists => format!(
                                                     "No playlist in your library matches “{}”.",
                                                     model.query()
@@ -1253,6 +1300,19 @@ impl Component for AppModel {
             activate.input(AppMsg::LibraryActivated(position));
         });
 
+        let history: TypedListView<HistoryItem, gtk::NoSelection> = TypedListView::new();
+        let activate = sender.clone();
+        history.view.connect_activate(move |_, position| {
+            activate.input(AppMsg::HistoryActivated(position));
+        });
+        let link_sender = sender.clone();
+        let open_history_link: OpenLink = std::rc::Rc::new(move |catalog_id, link| {
+            link_sender.input(AppMsg::OpenTrackPage {
+                catalog_id,
+                album: link == Link::Album,
+            });
+        });
+
         // One handler for every list's rows. `setup` is a static method with no
         // item to carry a callback, so this is installed once, here.
         let menu_sender = sender.clone();
@@ -1276,11 +1336,11 @@ impl Component for AppModel {
                 QueueViewOutput::Move { from, to } => AppMsg::MoveQueueItem { from, to },
                 QueueViewOutput::SetShuffle(on) => AppMsg::SetShuffle(on),
                 QueueViewOutput::SetRepeat(mode) => AppMsg::SetRepeat(mode),
-                QueueViewOutput::GoToAlbum(catalog_id) => AppMsg::OpenQueueTrackPage {
+                QueueViewOutput::GoToAlbum(catalog_id) => AppMsg::OpenTrackPage {
                     catalog_id,
                     album: true,
                 },
-                QueueViewOutput::GoToArtist(catalog_id) => AppMsg::OpenQueueTrackPage {
+                QueueViewOutput::GoToArtist(catalog_id) => AppMsg::OpenTrackPage {
                     catalog_id,
                     album: false,
                 },
@@ -1402,6 +1462,11 @@ impl Component for AppModel {
             built_albums: None,
             built_artists: None,
             built_playlists: None,
+            plays: Vec::new(),
+            history_rows: Vec::new(),
+            history,
+            history_art_widgets: art_registry(),
+            open_history_link,
             album_art_widgets: art_registry(),
             artist_art_widgets: art_registry(),
             playlist_art_widgets: art_registry(),
@@ -1516,6 +1581,7 @@ impl Component for AppModel {
         // The rows exist by now but were drawn before the cache was read, so
         // every pin still says "Unavailable".
         model.refresh_pin_names();
+        model.load_history(&sender);
 
         connect(&sender);
 
@@ -1773,6 +1839,7 @@ impl AppModel {
                     View::Songs => self.rebuild_rows(),
                     View::Albums => self.rebuild_albums(),
                     View::Artists => self.rebuild_artists(),
+                    View::History => self.rebuild_history(),
                     View::Playlists => self.rebuild_playlists(),
                     View::Search => {
                         self.search_gen = self.search_gen.wrapping_add(1);
@@ -1853,6 +1920,7 @@ impl AppModel {
                     View::Songs => self.rebuild_rows(),
                     View::Albums => self.rebuild_albums(),
                     View::Artists => self.rebuild_artists(),
+                    View::History => self.rebuild_history(),
                     View::Playlists => self.rebuild_playlists(),
                     View::Search => {
                         self.search_gen = self.search_gen.wrapping_add(1);
@@ -1928,6 +1996,9 @@ impl AppModel {
                     let offset = self.catalog_paged;
                     self.run_catalog_search(&sender, generation, offset);
                 }
+            }
+            AppMsg::ReloadCurrentSection if self.view == View::History => {
+                self.load_history(&sender);
             }
             AppMsg::ReloadCurrentSection => {
                 self.reload(self.view, &sender);
@@ -2071,7 +2142,8 @@ impl AppModel {
                 }
             }
             AppMsg::OpenPage(kind) => self.push_page(kind, &sender),
-            AppMsg::OpenQueueTrackPage { catalog_id, album } => {
+            AppMsg::HistoryActivated(position) => self.play_history_from(position),
+            AppMsg::OpenTrackPage { catalog_id, album } => {
                 // Which album or artist a track belongs to is a catalog lookup,
                 // so it goes where the tokens are (rule 7).
                 self.ask(Request::Open {
@@ -2307,6 +2379,7 @@ impl AppModel {
         let sender = sender.clone();
         match msg {
             CommandMsg::QuitWritten => notify::quit_cleanly(),
+            CommandMsg::History(read) => self.fill_history(read),
             CommandMsg::Pruned(report) => {
                 // Reported here rather than inside the sweep, so the sweep
                 // stays a function that returns facts and can be tested as one.
@@ -2362,6 +2435,7 @@ impl AppModel {
                     &self.album_art_widgets,
                     &self.artist_art_widgets,
                     &self.playlist_art_widgets,
+                    &self.history_art_widgets,
                 ] {
                     for widget in registry.borrow().get(&key).into_iter().flatten() {
                         widget.set_texture(&texture);
@@ -2444,6 +2518,7 @@ impl AppModel {
             View::Playlists => {
                 self.tried_playlists = false;
             }
+            View::History => {}
         }
     }
 

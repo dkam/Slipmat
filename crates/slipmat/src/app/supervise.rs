@@ -144,6 +144,9 @@ impl AppModel {
                 if clear {
                     self.forget_session(sender);
                 }
+                // A daemon that answers has opened the history, so a file it
+                // had to bring up to date can be read now.
+                self.load_history(sender);
             }
             Event::LibraryChanged => {
                 tracing::info!("the daemon refreshed the library");
@@ -152,6 +155,7 @@ impl AppModel {
             Event::LibraryRefreshing { refreshing } => {
                 self.set_library_refreshing(refreshing);
             }
+            Event::PlaysChanged => self.load_history(sender),
             Event::Page {
                 id,
                 header,

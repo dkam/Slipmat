@@ -67,6 +67,7 @@ pub enum Section {
     Library,
     Albums,
     Artists,
+    History,
     Playlists,
     Catalog,
 }
@@ -77,6 +78,7 @@ impl Section {
             Self::Library => "library",
             Self::Albums => "albums",
             Self::Artists => "artists",
+            Self::History => "history",
             Self::Playlists => "playlists",
             Self::Catalog => "catalog",
         }
@@ -87,6 +89,7 @@ impl Section {
             "catalog" => Self::Catalog,
             "albums" => Self::Albums,
             "artists" => Self::Artists,
+            "history" => Self::History,
             "playlists" => Self::Playlists,
             _ => Self::Library,
         }

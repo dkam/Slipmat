@@ -477,6 +477,11 @@ pub enum Event {
     #[serde(rename = "libraryChanged")]
     LibraryChanged,
 
+    /// A play went into the history. An invalidation too: a client reads the
+    /// history the daemon keeps, as it reads the library.
+    #[serde(rename = "playsChanged")]
+    PlaysChanged,
+
     /// Whether the daemon is replacing the complete library cache.
     #[serde(rename = "libraryRefreshing")]
     LibraryRefreshing { refreshing: bool },
