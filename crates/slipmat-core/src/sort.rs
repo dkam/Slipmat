@@ -3,8 +3,11 @@
 
 //! What a list is ordered by, and which way round.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
+use crate::entry::Entry;
 use crate::ipc::View;
 use crate::music::types::{Album, Artist, Playlist, Track};
 
@@ -164,5 +167,61 @@ impl SortBy {
     /// artist has — the direction toggle is the whole control here.
     pub fn compare_artist(a: &Artist, b: &Artist) -> std::cmp::Ordering {
         a.name.to_lowercase().cmp(&b.name.to_lowercase())
+    }
+}
+
+/// Move the songs that cannot be streamed after the ones that can, each group
+/// in the order it already had.
+///
+/// Called after any reversal, so reversing a list never brings them to the top.
+/// Only a song can be unplayable, so any other list comes back as it went in.
+pub fn unplayable_last(entries: &mut [Entry], dead: &HashSet<String>) {
+    // `sort_by_key` is stable, which is what keeps each group's order.
+    entries.sort_by_key(|entry| match entry {
+        Entry::Song(track) => track.catalog_id.as_ref().is_none_or(|id| dead.contains(id)),
+        _ => false,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::music::types::TrackId;
+
+    fn song(title: &str, catalog_id: Option<&str>) -> Entry {
+        Entry::Song(Track {
+            date_added: String::new(),
+            year: String::new(),
+            favorite: false,
+            in_library: true,
+            library_id: None,
+            id: TrackId(title.into()),
+            catalog_id: catalog_id.map(Into::into),
+            title: title.into(),
+            artist: String::new(),
+            album: String::new(),
+            duration_ms: 0,
+            track_number: 0,
+            artwork: None,
+        })
+    }
+
+    fn titles(entries: &[Entry]) -> Vec<&str> {
+        entries.iter().map(Entry::title).collect()
+    }
+
+    #[test]
+    fn unplayable_songs_go_last_in_the_order_they_had() {
+        // An upload has no catalog id at all; "Refused" has one MusicKit turned
+        // down. Both are unplayable, and both keep their places relative to
+        // each other, as the playable ones do.
+        let mut entries = vec![
+            song("Uploaded", None),
+            song("A", Some("1")),
+            song("Refused", Some("2")),
+            song("B", Some("3")),
+        ];
+        unplayable_last(&mut entries, &HashSet::from(["2".to_owned()]));
+        assert_eq!(titles(&entries), ["A", "B", "Uploaded", "Refused"]);
     }
 }

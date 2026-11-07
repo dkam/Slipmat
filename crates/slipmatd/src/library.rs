@@ -8,7 +8,8 @@ use slipmat_core::entry::Entry;
 use slipmat_core::ipc::View;
 use slipmat_core::library_cache;
 use slipmat_core::music::types::{Album, Artist, Playlist, Track};
-use slipmat_core::sort::SortBy;
+use slipmat_core::sort::{self, SortBy};
+use std::collections::HashSet;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Library {
@@ -35,15 +36,15 @@ impl Library {
     ///
     /// Returns the total *before* the window, so a client can size a scrollbar
     /// without asking for 535 rows it will not draw.
-    pub fn browse(
-        &self,
-        view: View,
-        query: &str,
-        offset: usize,
-        limit: usize,
-        sort: SortBy,
-        reverse: bool,
-    ) -> (Vec<Entry>, usize) {
+    pub fn browse(&self, ask: &Ask, dead: &HashSet<String>) -> (Vec<Entry>, usize) {
+        let Ask {
+            view,
+            query,
+            offset,
+            limit,
+            sort,
+            reverse,
+        } = *ask;
         let needle = query.trim().to_lowercase();
         let all: Vec<Entry> = match view {
             View::Songs => self
@@ -84,6 +85,7 @@ impl Library {
         if reverse != sort.descends_by_default() {
             all.reverse();
         }
+        sort::unplayable_last(&mut all, dead);
 
         let total = all.len();
         let window = all
@@ -95,6 +97,18 @@ impl Library {
             .collect();
         (window, total)
     }
+}
+
+/// What a client asked `browse` for: [`Request::Browse`](slipmat_core::ipc::Request),
+/// less the parts the daemon answers with.
+#[derive(Debug, Clone, Copy)]
+pub struct Ask<'a> {
+    pub view: View,
+    pub query: &'a str,
+    pub offset: usize,
+    pub limit: usize,
+    pub sort: SortBy,
+    pub reverse: bool,
 }
 
 /// Order a list of one kind of thing.
@@ -154,6 +168,17 @@ mod tests {
         }
     }
 
+    fn songs(query: &str, offset: usize, limit: usize) -> Ask<'_> {
+        Ask {
+            view: View::Songs,
+            query,
+            offset,
+            limit,
+            sort: SortBy::Title,
+            reverse: false,
+        }
+    }
+
     fn library() -> Library {
         Library {
             tracks: vec![
@@ -169,7 +194,7 @@ mod tests {
     fn a_window_reports_the_total_before_it_was_windowed() {
         // A client draws a screenful and a scrollbar. The scrollbar needs the
         // number it did not receive.
-        let (rows, total) = library().browse(View::Songs, "", 1, 1, SortBy::Title, false);
+        let (rows, total) = library().browse(&songs("", 1, 1), &HashSet::new());
         assert_eq!(rows.len(), 1);
         assert_eq!(total, 3);
     }
@@ -179,7 +204,7 @@ mod tests {
         // The alternative is every client guessing a number larger than the
         // library, which is the kind of thing that works until someone has
         // 20,000 songs.
-        let (rows, _) = library().browse(View::Songs, "", 0, 0, SortBy::Title, false);
+        let (rows, _) = library().browse(&songs("", 0, 0), &HashSet::new());
         assert_eq!(rows.len(), 3);
     }
 
@@ -187,15 +212,29 @@ mod tests {
     fn the_query_reaches_past_the_title() {
         // Searching an artist you can spell but whose track titles you cannot
         // is the ordinary case, not the clever one.
-        let (rows, total) = library().browse(View::Songs, "odesza", 0, 0, SortBy::Title, false);
+        let (rows, total) = library().browse(&songs("odesza", 0, 0), &HashSet::new());
         assert_eq!(total, 1);
         assert!(matches!(&rows[0], Entry::Song(t) if t.title == "A Moment Apart"));
     }
 
     #[test]
     fn an_offset_past_the_end_is_empty_rather_than_a_panic() {
-        let (rows, total) = library().browse(View::Songs, "", 99, 10, SortBy::Title, false);
+        let (rows, total) = library().browse(&songs("", 99, 10), &HashSet::new());
         assert!(rows.is_empty());
         assert_eq!(total, 3, "the total still describes the library");
+    }
+
+    #[test]
+    fn unplayable_songs_stay_last_when_the_list_is_reversed() {
+        // And before the window is taken, so a client's first page is the
+        // playable songs, not a page of rows it cannot play.
+        let dead = HashSet::from(["Colors".to_owned()]);
+        let ask = Ask {
+            reverse: true,
+            ..songs("", 0, 0)
+        };
+        let (rows, _) = library().browse(&ask, &dead);
+        let titles: Vec<&str> = rows.iter().map(Entry::title).collect();
+        assert_eq!(titles, ["Wind Shear", "A Moment Apart", "Colors"]);
     }
 }

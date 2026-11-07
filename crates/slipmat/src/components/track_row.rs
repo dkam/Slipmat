@@ -171,11 +171,6 @@ pub fn apply_row_state(icon: &gtk::Image, root: &gtk::Box, playing: bool, playab
     // An unplayable track is shown, not hidden — it is in the library, and
     // pretending otherwise is more confusing than dimming it.
     root.set_sensitive(playable);
-    root.set_tooltip_text(if playable {
-        None
-    } else {
-        Some("Not available to stream — this track is only in your library")
-    });
 }
 
 /// Icon name and CSS classes for a row's leading indicator.
@@ -397,7 +392,13 @@ impl RelmListItem for LibraryItem {
         };
 
         widgets.title.set_label(self.entry.title());
-        widgets.subtitle.set_label(&self.entry.subtitle());
+        // In the subtitle rather than a tooltip: a dimmed row has to say why
+        // without being hovered, and the artist is the part least needed then.
+        if self.playable() {
+            widgets.subtitle.set_label(&self.entry.subtitle());
+        } else {
+            widgets.subtitle.set_label("Not available on Apple Music");
+        }
 
         // A chevron says "this opens something". Songs do not.
         let opens = self.entry.opens_a_page();
@@ -442,7 +443,6 @@ impl RelmListItem for LibraryItem {
                 widgets.icon.set_icon_name(Some(icon(other)));
                 widgets.icon.set_css_classes(&["dim-label"]);
                 root.set_sensitive(true);
-                root.set_tooltip_text(None);
             }
         }
     }
