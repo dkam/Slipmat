@@ -63,7 +63,10 @@ impl Theme {
 /// left it rather than always on the same one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Section {
+    /// Apple's shelves. The default, because a music app opens on what it
+    /// recommends rather than on a flat list of everything you own (#35).
     #[default]
+    Home,
     Library,
     Albums,
     Artists,
@@ -75,6 +78,7 @@ pub enum Section {
 impl Section {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Home => "home",
             Self::Library => "library",
             Self::Albums => "albums",
             Self::Artists => "artists",
@@ -91,7 +95,11 @@ impl Section {
             "artists" => Self::Artists,
             "history" => Self::History,
             "playlists" => Self::Playlists,
-            _ => Self::Library,
+            "library" => Self::Library,
+            // An ini from before Home existed has no such key, and a
+            // hand-edited or future value must not send startup somewhere
+            // arbitrary: both are the landing view.
+            _ => Self::Home,
         }
     }
 }
@@ -356,6 +364,7 @@ mod tests {
     #[test]
     fn section_round_trips_and_falls_back() {
         for section in [
+            Section::Home,
             Section::Library,
             Section::Albums,
             Section::Artists,
@@ -366,8 +375,10 @@ mod tests {
         }
         // A hand-edited or future-version ini must not break startup. This
         // once used "playlists" as the unknown value, which stopped being one.
-        assert_eq!(Section::parse("radio"), Section::Library);
-        assert_eq!(Section::parse(""), Section::Library);
+        // Unknown now means the landing view rather than whichever section was
+        // first when this was written.
+        assert_eq!(Section::parse("radio"), Section::Home);
+        assert_eq!(Section::parse(""), Section::Home);
     }
 
     #[test]

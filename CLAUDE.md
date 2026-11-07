@@ -534,13 +534,14 @@ request per artless playlist, because a tile knows no tracks.
 
 ### Restoring the last session
 
-Four files, three homes, and the distinction is not pedantry:
+Five files, three homes, and the distinction is not pedantry:
 
 | What | Where | Why |
 | --- | --- | --- |
 | Preferences | `~/.config/slipmat/settings.ini` | somebody chose them |
 | Unplayable ids | `~/.cache/slipmat/unplayable.json` | rederivable — Apple will tell us again |
 | The library | `~/.cache/slipmat/library.json` | likewise, and 430 KB of it |
+| Home | `~/.cache/slipmat/home.json` | likewise, and Apple dates it |
 | The last queue | `$XDG_STATE_HOME/slipmat/session.json` | neither chosen nor rederivable |
 
 Two rules the restore follows:
@@ -712,7 +713,8 @@ crates/slipmat-core/   # the engine. No toolkit reaches in here.
     state.rs         # PlayerState: now playing, position, queue *projection* (+ tests)
   src/music/
     client.rs        # reqwest → api.music.apple.com; storefront; errors that name the fix
-    types.rs         # Track / Album / Artist / Playlist / Artwork (+ tests). JSON stops here.
+    types.rs         # Track / Album / Artist / Playlist / Station / Shelf / Artwork (+ tests). JSON stops here.
+  src/home_cache.rs  # Apple's Home shelves, → ~/.cache/slipmat/home.json. Honours nextUpdateDate.
 
 crates/slipmat/        # the GTK client. One frontend of several to come.
   src/
@@ -721,6 +723,7 @@ crates/slipmat/        # the GTK client. One frontend of several to come.
     mod.rs           # root Component: AppModel, AppMsg, CommandMsg, update, view!
     view.rs          # which section is showing; the three encodings of that
     library.rs       # loading + filtering songs, albums, artists, catalog search
+    home.rs          # Home's shelves: headings, strips, and the station that plays
     queue.rs         # click → setQueue, and healing a queue MusicKit rejected
     pages.rs         # the album / artist navigation stack
     playback.rs      # mirrored state → Now Playing bar, MPRIS, notifications
@@ -827,8 +830,25 @@ This is Redux with a compiler: actions in, one reducer, view derived from state.
   narrow. Scrubbing lives in the drawer, which has the width for it. The bar is
   visible on every page — it is the app.
 - Main content: `adw::NavigationView` over an `adw::ViewStack` (clamped) —
-  **Library** (playlists / albums / songs) and **Search**. The queue is an
-  `adw::Dialog` or a sidebar sheet from the bottom bar, not a page.
+  **Home** (Apple's shelves), **Library** (playlists / albums / songs) and
+  **Search**. The queue is an `adw::Dialog` or a sidebar sheet from the bottom
+  bar, not a page.
+- `Home` is what the app opens on (#35): a stack of shelves, each a heading and
+  a horizontally scrolling strip of the same tiles the grids bind. A station
+  tile **plays** rather than opening a page — its queue is MusicKit's to
+  generate, which is why `Command::SetStation` exists and why a station never
+  reaches `session.json` (`save_session` asks the daemon's station marker; the
+  mirror would otherwise write MusicKit's generated items down as a queue).
+
+  **Measured 2026-10-25, because none of it could be read off the docs:**
+  `/me/recommendations` returned 18 shelves whose contents are albums,
+  playlists **and stations** (15 station tiles, the personal one among them),
+  and `attributes.title` is an **object** (`stringForDisplay`), not a string —
+  typed as a `String`, every fetch failed to decode. `nextUpdateDate` came back
+  within a minute of the request itself, so it expires almost at once and the
+  cache buys the instant draw rather than a saved round trip. The personal
+  station answers, and is usually already in Apple's feed, so the station
+  endpoints are a **fallback shelf** holding only what the feed left out.
 - Rows are `adw::ActionRow` with artwork as prefix; activating a row sends
   `PlayTrack` with the **whole containing list** as the queue and the row's index
   as `start` — never a single-track queue (rule 3).

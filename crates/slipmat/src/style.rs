@@ -244,6 +244,15 @@ pub fn set_accent(accent: Accent) {
              background: none;
          }}
 
+         /* A shelf tile is a button, because Home has to be usable with the
+            keyboard and a plain Box is not focusable. The button's padding
+            would then decide the tile's size instead of the tile itself, and
+            its background would paint a box around every cover. */
+         .tile-button {{
+             padding: 0;
+             background: none;
+         }}
+
          /* Same reason. A GridView draws its own background, so insetting it
             with a margin shows a band of the window around every grid. */
          .tile-grid {{

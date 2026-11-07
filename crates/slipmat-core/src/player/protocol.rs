@@ -49,6 +49,22 @@ pub enum Command {
         start_time_ms: u64,
     },
 
+    /// Play a **station** instead of a list of songs.
+    ///
+    /// A station's id is `ra.…` and it has no `catalog_id`, so `SetQueue`'s
+    /// song ids cannot name one — and there is no list to send anyway: MusicKit
+    /// generates the queue as it plays. The queue that arrives afterwards is
+    /// MusicKit's, which is the same rule as everywhere else (rule 3): Rust
+    /// asks, MusicKit decides, and `PlayerState` mirrors the answer.
+    #[serde(rename = "setStation", rename_all = "camelCase")]
+    SetStation {
+        /// `ra.…`.
+        id: String,
+        /// False exactly when restoring: the station comes back loaded and
+        /// idle, so pressing Play continues it and nothing starts by itself.
+        start_playing: bool,
+    },
+
     #[serde(rename = "play")]
     Play,
     #[serde(rename = "pause")]
@@ -154,6 +170,7 @@ impl Command {
     pub fn name(&self) -> &'static str {
         match self {
             Self::SetQueue { .. } => "setQueue",
+            Self::SetStation { .. } => "setStation",
             Self::Play => "play",
             Self::Pause => "pause",
             Self::PlayPause => "playPause",
